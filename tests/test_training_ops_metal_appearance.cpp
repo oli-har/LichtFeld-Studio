@@ -6,10 +6,14 @@
 // byte outputs are exact; floats use tolerances; the bilateral and PPISP
 // gradients are checked against central differences of the CPU forward.
 
+#include "components/bilateral_grid.hpp"
 #include "core/shared_image_ops.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor_backend.hpp"
+#include "core/tensor_execution.hpp"
 #include "core/tensor_image.hpp"
+#include "core/tensor_upload.hpp"
+#include "cuda_backend_test.hpp"
 #include "lfs/training/ops/registry.hpp"
 
 #include <gtest/gtest.h>
@@ -25,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -1270,6 +1275,79 @@ namespace {
     }
 
     INSTANTIATE_TEST_SUITE_P(Backends, PortableAppearance, testing::Values(GpuBackend::Metal, GpuBackend::Vulkan),
+                             [](const auto& info) { return std::string(lfs::core::gpu_backend_name(info.param)); });
+
+    // The bilateral grid component runs its ops on the default backend, so the backend under test becomes it.
+    class PortableBilateralGrid : public ::testing::TestWithParam<GpuBackend> {
+    protected:
+        void SetUp() override {
+            if (!lfs::core::gpu_backend_available(backend_under_test()))
+                GTEST_SKIP() << lfs::core::gpu_backend_name(GetParam()) << " device unavailable";
+            session_.emplace(backend_under_test());
+            ASSERT_TRUE(session_->switched());
+        }
+        void TearDown() override { session_.reset(); }
+
+    private:
+        std::optional<lfs::test::DefaultGpuBackendForTesting> session_;
+    };
+
+    lfs::training::BilateralGrid perturbed_grid() {
+        lfs::training::BilateralGrid grid(3, 8, 8, 4, 50, {}, lfs::training::BilateralGridParameterization::ExposureChroma);
+        Tensor& cells = grid.grids();
+        float* const values = cells.ptr<float>();
+        for (size_t i = 0; i < cells.numel(); ++i)
+            values[i] += 0.05f * std::sin(0.37f * static_cast<float>(i));
+        return grid;
+    }
+
+    // Two device slots hold the images in use, and an image that is not resident replaces the least recently used
+    // one. A grid whose images take turns in the slots ends where one that reloads every image from the host does.
+    TEST_P(PortableBilateralGrid, SlotSwapsKeepEachImagesGridAndMoments) {
+        const Tensor image = gpu(pattern(3 * 12 * 16, 0.35f, 11, 0.5f), {3, 12, 16});
+        auto swapped = perturbed_grid();
+        auto reloaded = perturbed_grid();
+        for (const int i : {0, 1, 2, 0, 1, 2}) {
+            (void)swapped.apply(image, i);
+            swapped.step_image(i, 1.0f);
+            (void)reloaded.grids();
+            (void)reloaded.apply(image, i);
+            reloaded.step_image(i, 1.0f);
+        }
+        const auto expected = host(std::as_const(reloaded).grids());
+        const auto actual = host(std::as_const(swapped).grids());
+        ASSERT_EQ(actual.size(), expected.size());
+        for (size_t i = 0; i < actual.size(); ++i)
+            ASSERT_NEAR(actual[i], expected[i], 1e-6f) << "cell " << i;
+    }
+
+    // Each slot has its own storage, so on Metal swapping an image into the least recently used slot only waits
+    // for the GPU work on that slot, not for queued work on the other one. Vulkan's slot copies wait on the queue.
+    TEST_P(PortableBilateralGrid, SlotSwapDoesNotWaitForWorkOnTheOtherSlot) {
+        if (backend_under_test() != GpuBackend::Metal)
+            GTEST_SKIP() << "only Metal copies the slots without a queue wait";
+        const Tensor image = gpu(pattern(3 * 12 * 16, 0.35f, 11, 0.5f), {3, 12, 16});
+        auto grid = perturbed_grid();
+        grid.step_image(0, 1.0f); // image 0's slot now has to be written back when it is replaced
+        lfs::core::TensorFence stepped(GpuBackend::Metal);
+        stepped.record(lfs::core::TensorExecutionTarget::current());
+        stepped.wait();
+        constexpr size_t n = 2048;
+        Tensor product = Tensor::ones({n, n}, Device::GPU);
+        const Tensor identity = Tensor::eye(n, Device::GPU);
+        for (int i = 0; i < 40; ++i)
+            product = product.mm(identity);
+        (void)grid.apply(image, 1); // queued behind that work, so image 1's slot stays in use until it is done
+        lfs::core::TensorFence queued(GpuBackend::Metal);
+        queued.record(lfs::core::TensorExecutionTarget::current());
+        if (queued.ready())
+            GTEST_SKIP() << "the GPU finished the queued work before the swap";
+        (void)grid.apply(image, 2); // image 2 replaces image 0
+        EXPECT_FALSE(queued.ready()) << "the swap waited for the work on the other slot";
+        queued.wait();
+    }
+
+    INSTANTIATE_TEST_SUITE_P(Backends, PortableBilateralGrid, testing::Values(GpuBackend::Metal, GpuBackend::Vulkan),
                              [](const auto& info) { return std::string(lfs::core::gpu_backend_name(info.param)); });
 
 } // namespace

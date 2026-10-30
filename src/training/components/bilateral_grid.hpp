@@ -153,9 +153,12 @@ namespace lfs::training {
         lfs::core::Tensor grids_;
         lfs::core::Tensor exp_avg_;
         lfs::core::Tensor exp_avg_sq_;
-        lfs::core::Tensor resident_grids_; // [kResidentSlots, C, L, H, W]
-        lfs::core::Tensor resident_exp_avg_;
-        lfs::core::Tensor resident_exp_avg_sq_;
+        // Each slot [1, C, L, H, W] has its own storage. A backend that copies between host and device
+        // memory on the host (Metal) then waits only for the GPU work on the slot it swaps, the least
+        // recently used one, not for the step that is still using the other slot.
+        std::array<lfs::core::Tensor, kResidentSlots> resident_grids_;
+        std::array<lfs::core::Tensor, kResidentSlots> resident_exp_avg_;
+        std::array<lfs::core::Tensor, kResidentSlots> resident_exp_avg_sq_;
         mutable std::array<ResidentSlot, kResidentSlots> slots_{};
         uint64_t slot_clock_ = 0;
         // Stream of the latest slice copy; the legacy default stream is a null handle.
