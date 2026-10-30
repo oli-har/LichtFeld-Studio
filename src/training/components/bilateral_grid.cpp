@@ -306,7 +306,7 @@ namespace lfs::training {
 
         const ImageLayout layout = validate_image_tensor(rgb, "BilateralGrid::apply");
         const int slot = resident_slot(image_idx);
-        const auto grid = resident_grids_.slice(0, slot, slot + 1);
+        const auto& grid = resident_grids_[static_cast<size_t>(slot)];
         assert(static_cast<int>(grids_.shape()[1]) == channels_);
         training_ops(lfs::core::default_gpu_backend()).bilateral->slice_forward(grid, rgb, shared_offset_, output, {.layout = layout.chw ? ops::Layout::CHW : ops::Layout::HWC, .transform = parameterization_ == BilateralGridParameterization::ExposureChroma ? ops::GridTransform::ExposureChroma : ops::GridTransform::Affine});
     }
@@ -344,7 +344,7 @@ namespace lfs::training {
 
         const auto rgb_cont = rgb.contiguous();
         const int slot = resident_slot(image_idx);
-        const auto grid = resident_grids_.slice(0, slot, slot + 1);
+        const auto& grid = resident_grids_[static_cast<size_t>(slot)];
         assert(static_cast<int>(grids_.shape()[1]) == channels_);
         slice_grad_.zero_();
         training_ops(lfs::core::default_gpu_backend()).bilateral->slice_backward(grid, rgb_cont, grad_output, shared_offset_, slice_grad_, grad_rgb, {.layout = layout.chw ? ops::Layout::CHW : ops::Layout::HWC, .transform = parameterization_ == BilateralGridParameterization::ExposureChroma ? ops::GridTransform::ExposureChroma : ops::GridTransform::Affine});
@@ -365,7 +365,7 @@ namespace lfs::training {
         }
         tv_loss_scalar_.zero_();
         const int slot = resident_slot(image_idx);
-        const auto grid = resident_grids_.slice(0, slot, slot + 1);
+        const auto& grid = resident_grids_[static_cast<size_t>(slot)];
         training_ops(lfs::core::default_gpu_backend()).bilateral->tv_forward(grid, tv_loss_scalar_, tv_temp_buffer_, num_images_);
         return tv_loss_scalar_;
     }
@@ -375,7 +375,7 @@ namespace lfs::training {
             throw std::out_of_range("BilateralGrid::tv_backward: image_idx out of range");
         }
         const int slot = resident_slot(image_idx);
-        const auto grid = resident_grids_.slice(0, slot, slot + 1);
+        const auto& grid = resident_grids_[static_cast<size_t>(slot)];
         training_ops(lfs::core::default_gpu_backend()).bilateral->tv_backward(grid, slice_grad_, tv_weight, num_images_);
     }
 
@@ -385,9 +385,9 @@ namespace lfs::training {
         }
         const int slot = resident_slot(image_idx);
         slots_[static_cast<size_t>(slot)].dirty = true;
-        auto grid = resident_grids_.slice(0, slot, slot + 1);
-        auto exp_avg = resident_exp_avg_.slice(0, slot, slot + 1);
-        auto exp_avg_sq = resident_exp_avg_sq_.slice(0, slot, slot + 1);
+        auto& grid = resident_grids_[static_cast<size_t>(slot)];
+        auto& exp_avg = resident_exp_avg_[static_cast<size_t>(slot)];
+        auto& exp_avg_sq = resident_exp_avg_sq_[static_cast<size_t>(slot)];
         const int64_t K = step_ - last_step_[static_cast<size_t>(image_idx)];
         if (K > 1) {
             const double skipped = static_cast<double>(K - 1);
@@ -482,12 +482,14 @@ namespace lfs::training {
 
     void BilateralGrid::allocate_resident_slots() {
         const lfs::core::TensorShape shape{
-            static_cast<size_t>(kResidentSlots), static_cast<size_t>(channels_),
+            size_t{1}, static_cast<size_t>(channels_),
             static_cast<size_t>(grid_guidance_), static_cast<size_t>(grid_height_),
             static_cast<size_t>(grid_width_)};
-        resident_grids_ = lfs::core::Tensor::empty(shape, lfs::core::Device::GPU);
-        resident_exp_avg_ = lfs::core::Tensor::empty(shape, lfs::core::Device::GPU);
-        resident_exp_avg_sq_ = lfs::core::Tensor::empty(shape, lfs::core::Device::GPU);
+        for (size_t slot = 0; slot < resident_grids_.size(); ++slot) {
+            resident_grids_[slot] = lfs::core::Tensor::empty(shape, lfs::core::Device::GPU);
+            resident_exp_avg_[slot] = lfs::core::Tensor::empty(shape, lfs::core::Device::GPU);
+            resident_exp_avg_sq_[slot] = lfs::core::Tensor::empty(shape, lfs::core::Device::GPU);
+        }
         slots_ = {};
         slot_clock_ = 0;
     }
@@ -514,12 +516,12 @@ namespace lfs::training {
         const size_t elements = slice_elements();
         const size_t host_offset = static_cast<size_t>(image_idx) * elements;
         const std::array<std::pair<lfs::core::Tensor*, lfs::core::Tensor*>, 3> tensors{{
-            {&grids_, &resident_grids_},
-            {&exp_avg_, &resident_exp_avg_},
-            {&exp_avg_sq_, &resident_exp_avg_sq_},
+            {&grids_, &resident_grids_[victim]},
+            {&exp_avg_, &resident_exp_avg_[victim]},
+            {&exp_avg_sq_, &resident_exp_avg_sq_[victim]},
         }};
         for (const auto& [host, device] : tensors) {
-            training_ops(lfs::core::default_gpu_backend()).bilateral->upload_slice(*host, *device, host_offset, victim * elements, elements);
+            training_ops(lfs::core::default_gpu_backend()).bilateral->upload_slice(*host, *device, host_offset, 0, elements);
         }
         slots_[victim] = {.image = image_idx, .dirty = false, .last_use = ++slot_clock_};
         return static_cast<int>(victim);
@@ -538,13 +540,14 @@ namespace lfs::training {
         auto& self = const_cast<BilateralGrid&>(*this);
         const size_t elements = slice_elements();
         const size_t host_offset = static_cast<size_t>(state.image) * elements;
+        const auto index = static_cast<size_t>(slot);
         const std::array<std::pair<lfs::core::Tensor*, lfs::core::Tensor*>, 3> tensors{{
-            {&self.grids_, &self.resident_grids_},
-            {&self.exp_avg_, &self.resident_exp_avg_},
-            {&self.exp_avg_sq_, &self.resident_exp_avg_sq_},
+            {&self.grids_, &self.resident_grids_[index]},
+            {&self.exp_avg_, &self.resident_exp_avg_[index]},
+            {&self.exp_avg_sq_, &self.resident_exp_avg_sq_[index]},
         }};
         for (const auto& [host, device] : tensors) {
-            training_ops(lfs::core::default_gpu_backend()).bilateral->download_slice(*host, *device, host_offset, static_cast<size_t>(slot) * elements, elements);
+            training_ops(lfs::core::default_gpu_backend()).bilateral->download_slice(*host, *device, host_offset, 0, elements);
         }
         state.dirty = false;
     }
@@ -575,7 +578,7 @@ namespace lfs::training {
 
     lfs::core::Tensor BilateralGrid::channel_mean_of_image(int image_idx) {
         const auto slot = static_cast<size_t>(resident_slot(image_idx));
-        return resident_grids_.slice(0, slot, slot + 1).squeeze(0).flatten(1).mean(1);
+        return resident_grids_[slot].squeeze(0).flatten(1).mean(1);
     }
 
     void BilateralGrid::project_image(int image_idx) {
@@ -585,7 +588,7 @@ namespace lfs::training {
         const auto mean = channel_mean_of_image(image_idx);
         const int slot = resident_slot(image_idx);
         slots_[static_cast<size_t>(slot)].dirty = true;
-        auto grid = resident_grids_.slice(0, slot, slot + 1);
+        auto& grid = resident_grids_[static_cast<size_t>(slot)];
         training_ops(lfs::core::default_gpu_backend()).bilateral->project_mean(grid, mean, identity_mean_, 1);
         const float spatial = static_cast<float>(grid_guidance_ * grid_height_ * grid_width_);
         const float inv_n_spatial = 1.0f / (static_cast<float>(num_images_) * spatial);
