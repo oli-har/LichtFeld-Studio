@@ -374,6 +374,12 @@ TEST_F(TensorMultiStreamTest, PinnedBlockReusedOnlyAfterAllStreamsDone) {
               cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(d2h_stream), cudaSuccess);
 
+    // A spare cached block lets the allocation made while the gate is closed come from the cache.
+    // A cache miss would call cudaHostAlloc, which CUDA may serialize with the gated stream.
+    void* spare = pinned.allocate(kBytes);
+    ASSERT_NE(spare, nullptr);
+    pinned.deallocate(spare, d2h_stream);
+
     h2d_stream.close();
     ASSERT_EQ(cudaMemcpyAsync(device_buffer, host_block, kBytes, cudaMemcpyHostToDevice, h2d_stream.get()),
               cudaSuccess);
