@@ -6,7 +6,9 @@ This covers bug reports from the newest 100 of the 210 open issues on
 Windows test reports (#3944–#3948) are in [windows_test_failures.md](windows_test_failures.md).
 
 Everything here comes from reading upstream `dev` (`809251714`) on Linux, without a GPU,
-so nothing has been run. The confidence marks are the same as in the Windows plan:
+so nothing has been run. (On 2026-10-31 the branch built on the Windows CUDA PC, and its
+changes for these issues broke no existing test there, but none has been tried by hand.)
+The confidence marks are the same as in the Windows plan:
 
 - **Confirmed**: the code clearly does this.
 - **Likely**: it fits the evidence.

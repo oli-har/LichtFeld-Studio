@@ -10,6 +10,13 @@ That session ran on Linux without a GPU, CUDA or MSVC, so **nothing it changed h
 compiled or run**. This machine is the Windows CUDA PC where the bugs were found. Your job:
 build the work, check it, and carry on with what's left.
 
+**Update, 2026-10-31: Steps 1 and 2 are done.** On the PC everything builds, the fix
+checks pass, and the full runs leave 13 failures on CUDA and 15 on Vulkan, every one of
+which also failed on dev. Three more commits on the branch fix what the first version
+missed: #3947's real cause (a CUDA 12.8.0 compiler bug), three more exports for #3944,
+the RAD sidecar header padding and the LPIPS stack-trace check. The results are in
+"Results on the Windows CUDA PC" in `docs/windows_test_failures.md`. Carry on with Step 3.
+
 ## Where everything is
 
 - **Repository:** my fork, https://github.com/oli-har/LichtFeld-Studio. Upstream is
@@ -36,6 +43,8 @@ build the work, check it, and carry on with what's left.
     - a clear error when vcpkg is missing (#3205).
   - `16ce812cf`: save-step edits are applied even after a project save (#1651), and the
     timelapse honours `--enable-mip`.
+  - Then this handoff, and three commits from the Windows PC after its first build and
+    test runs (see the update above).
 - **Read these two files before anything else.** They are the plan and the record:
   - `docs/windows_test_failures.md`, for #3944–#3948. It starts with "Getting started on
     the Windows CUDA PC" (the prompt, the build commands and one gtest filter per fix).
@@ -62,11 +71,11 @@ Use the **x64 Native Tools Command Prompt for VS 2022**.
      fully fixed: note the unresolved symbols.
 
 If it doesn't compile, fix the cloud session's mistakes first; they were never compiled.
-The edits most likely to need attention:
+The edits most likely to need attention (all of them compiled on the Windows PC):
 
 - `src/core/atomic_file.cpp`: the Windows-only `MoveFileExW` retry loop.
 - `src/core/tensor/backend/cuda/kernels/tensor_spatial.cu`: the new `init_components`
-  kernel.
+  kernel, since taken out again: #3947 had another cause.
 - `src/visualizer/training/training_manager.cpp` and
   `src/visualizer/core/training_manager.hpp`: the `applied_param_serial_` edit serial.
 - `src/io/pipelined_image_loader.cpp`: the `LFS_JPEG2K_CACHE` switch.
@@ -85,10 +94,8 @@ The edits most likely to need attention:
 2. Run every filter in the "Checking the fixes" table in `docs/windows_test_failures.md`,
    with `--tensor-backend=cuda`, and also `vulkan` where the table says so.
 3. For #3947, also run its filter under `compute-sanitizer --tool memcheck` and
-   `--tool initcheck`. To learn the root cause rather than just the fix, check out
-   `f1ad7d687` and see whether `CUDA_LAUNCH_BLOCKING=1` makes the failures disappear. The
-   suspicion is an ordering race in how the `labels` tensor is initialized; see the #3947
-   section.
+   `--tool initcheck`. The cause turned out to be a CUDA 12.8.0 compiler bug, not an
+   ordering race; see the #3947 section.
 4. Do two full runs:
    `lichtfeld_tests --tensor-backend=cuda --gtest_brief=1 --gtest_output=xml:cuda.xml`,
    and the same with `vulkan`. Compare them with the lists in #3948.
@@ -159,8 +166,8 @@ The edits most likely to need attention:
 - DLL static destructors run after the GPU drivers have shut down.
 - Under WDDM, `cudaMalloc` can spill into system RAM.
 - DXGI reports a per-process memory budget.
-- Functions with internal linkage don't resolve in Release stack traces without private
-  PDB symbols.
+- A Release build has no PDB, so a stack trace names only the nearest exported function:
+  internal functions and test bodies can't be named.
 
 **Unconfirmed assumptions worth checking early:**
 
@@ -168,7 +175,8 @@ The edits most likely to need attention:
 - What really hung in #3946: the D2H synchronize or `cudaHostAlloc` while the gate was
   closed. The test now avoids both.
 - The WDDM sysmem fallback, for `TensorReserveInplaceCatCuda`.
-- Whether RmlUi keeps backslashes in tooltip attributes.
+- Whether RmlUi keeps backslashes in tooltip attributes. It does: on Windows,
+  `VideoExtractorNamingUiTest` passes expecting the native separator.
 
 **Earlier versions of the plan had some wrong guesses** (Unicode, HostMetrics, NvCodec, the
 flaky render test). The current docs replace them.

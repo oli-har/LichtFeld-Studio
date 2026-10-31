@@ -11,9 +11,9 @@ This covers the Windows `lichtfeld_tests` reports filed against dev `ab623c39d`:
 Other open upstream bugs are planned in [open_bug_plan.md](open_bug_plan.md).
 
 The branch `claude/vibrant-lovelace-747k7o` is upstream `dev` (`809251714`) plus these fixes.
-Everything was worked out by reading the code on Linux, without MSVC, CUDA or a GPU, so
-**nothing here has been compiled or run on Windows yet**. The only exception is the
-`UsdHalfTest` reference converter, which was checked numerically on Linux.
+They were first worked out by reading the code on Linux, without MSVC, CUDA or a GPU. They
+have since been built and run on the Windows CUDA PC, which needed a few more changes: see
+[Results on the Windows CUDA PC](#results-on-the-windows-cuda-pc).
 
 Each cause below is marked:
 
@@ -25,19 +25,40 @@ Each cause below is marked:
 
 | Issue | Tests | State |
 | --- | --- | --- |
-| #3944 | 3 programs | Fixed: exports, a `far` macro clash and link libraries |
-| #3945 | 5 node tests, plus 1 more found | Fixed in the tests |
-| #3946 | 1 | Fixed in the test |
-| #3947 | 8 node and tensor tests on CUDA | Fixed in the CUDA launch; one ordering question left to check |
-| #3948 | Open files, RAD sidecar, atomic writes (12) | Fixed: 8 test changes, plus 2 product fixes (RAD sidecar, atomic commit retry) |
-| #3948 | Paths, Unicode, case (7) | Fixed in the tests |
-| #3948 | `UsdHalfTest`, `LFS_HOME`, scene source path, camera node | Fixed (scene source path is a product fix) |
-| #3948 | `ViewerGpuMemory`, `SessionBreadcrumb`, `TensorReserveInplaceCat`, `LpipsOps` | Fixed (LPIPS by naming the operation in its messages) |
-| #3948 | `HostMetrics` | Plan: Windows never samples CPU usage (product gap) |
-| #3948 | `NvCodecSentinelValidator`, `VideoFrameExtractorTrim`, `VideoExportUtils` | Plan: one experiment each decides the fix |
-| #3948 | Camera validation (5) | Fixed: a product bug in `Camera`'s move constructor, on every platform |
-| #3948 | CUDA–Vulkan parity (5), masked SSIM | Plan: see [GPU numerics](#gpu-numerics) |
-| #3948 | Fused normal gradients (3), `NormalLossHunt`, stack overflow, VMA objects, crash at exit | Plan: see [Gradients and teardown](#gradients-stack-overflow-vma-objects-and-the-crash-at-exit). The exit crash and the stack overflow are product bugs with one shared cause |
+| #3944 | 3 programs | Fixed, passes on Windows: exports, a `far` macro clash and link libraries. One `vksplat_custom_effect_tests` test fails at run time, see [Still open](#still-open) |
+| #3945 | 5 node tests, plus 1 more found | Fixed in the tests, passes on Windows |
+| #3946 | 1 | Fixed in the test, passes on Windows |
+| #3947 | 8 node and tensor tests on CUDA | Fixed, passes on Windows: a CUDA 12.8.0 compiler bug, worked around in `finalComponentRoot` |
+| #3948 | Open files, RAD sidecar, atomic writes (12) | Fixed, passes on Windows: 8 test changes, plus 3 product fixes (RAD sidecar handles and header padding, atomic commit retry) |
+| #3948 | Paths, Unicode, case (7) | Fixed in the tests, passes on Windows |
+| #3948 | `UsdHalfTest`, `LFS_HOME`, scene source path, camera node | Fixed (scene source path is a product fix), passes on Windows |
+| #3948 | `ViewerGpuMemory`, `SessionBreadcrumb`, `TensorReserveInplaceCat`, `LpipsOps` | Fixed, passes on Windows (LPIPS by naming the operation in its messages, and by not looking for the test's name in the stack trace on Windows) |
+| #3948 | `HostMetrics` | Still fails: Windows never samples CPU usage (product gap) |
+| #3948 | `NvCodecSentinelValidator`, `VideoFrameExtractorTrim`, `VideoExportUtils` | The first two still fail; `VideoExportUtils` passed in both full runs on Windows |
+| #3948 | Camera validation (5) | Fixed, passes on Windows: a product bug in `Camera`'s move constructor, on every platform |
+| #3948 | CUDA–Vulkan parity (5), masked SSIM | Still fail: see [GPU numerics](#gpu-numerics) |
+| #3948 | Fused normal gradients (3), `NormalLossHunt`, stack overflow, VMA objects, crash at exit | Still fail: see [Gradients and teardown](#gradients-stack-overflow-vma-objects-and-the-crash-at-exit). The exit crash and the stack overflow are product bugs with one shared cause |
+
+## Results on the Windows CUDA PC
+
+Built and run on 2026-10-31: RTX 5090 (driver 617.14), Windows 11 10.0.26100, MSVC
+19.44.35229, CUDA 12.8.0 (V12.8.61), the `windows-release` preset. Other programs were
+open during the runs; every failure below also fails when its test runs alone.
+
+- **Build:** `lichtfeld_tests`, `vksplat_custom_effect_tests`, `shader_service_tests` and
+  `LichtFeld-Studio` build and link without `/FORCE:UNRESOLVED`.
+- **Fix checks:** every filter in [Checking the fixes](#checking-the-fixes) passes.
+  compute-sanitizer memcheck and initcheck report no errors on the two
+  `…MatchBruteForce` tests. `shader_service_tests` passes (49 tests) and
+  `vksplat_custom_effect_tests` passes 16 of 17.
+- **Full runs** (`lichtfeld_tests --tensor-backend=cuda` and `vulkan`, 10,086 tests each,
+  with the test names printed): no crash or hang while the tests ran. 13 tests fail on
+  CUDA and 15 on Vulkan, all in [Still open](#still-open). Every one of them also failed
+  on dev `ab623c39d` on this PC, so none is new. 52 tests on CUDA and 48 on Vulkan that
+  failed on dev now pass. The Vulkan run exited with 0xC0000005 after its report.
+- **Changes the Windows run needed** on top of the first version of this branch: the real
+  cause of #3947, three more exports for `vksplat_custom_effect_tests`, the RAD sidecar
+  header padding, and the LPIPS stack-trace check. Each is described in its section below.
 
 ## Getting started on the Windows CUDA PC
 
@@ -98,7 +119,7 @@ Tools that help:
 | Program | Cause | Change |
 | --- | --- | --- |
 | `lichtfeld_tests` | `gui::isBoundsGizmoActive()` is not exported from the `lfs_visualizer` DLL | `LFS_VIS_API` on its declaration (`src/visualizer/gui/bounds_gizmo.hpp`) |
-| `vksplat_custom_effect_tests` | `<windows.h>` defines `far` as an empty macro | The local is renamed `far_offset` (`tests/test_vksplat_custom_effect.cpp`) |
+| `vksplat_custom_effect_tests` | `<windows.h>` defines `far` as an empty macro. Behind that compile error, the test also calls three `VksplatViewportRenderer` members that weren't exported: `prepare`, `rerenderSelectionOverlay` and `invalidateStochasticHistory` | The local is renamed `far_offset` (`tests/test_vksplat_custom_effect.cpp`), and the three members get `LFS_VIS_API` (`src/visualizer/rendering/vksplat_viewport_renderer.hpp`) |
 | `shader_service_tests` | `lfs_visualizer` links the static `lfs_io` and `lfs_sequencer` privately, so their symbols don't reach the test through the DLL. `readOutputImageRgba` was the one `readOutputImage*` member without `LFS_VIS_API` | The test links `lfs_io` and `lfs_sequencer` itself, as `lichtfeld_visualizer_tests` does (`LFS_IO_API` is empty on Windows, so that's safe), and `readOutputImageRgba` is exported |
 
 ### #3945: node references kept across `add_node`
@@ -118,11 +139,14 @@ container with stable references (a `std::deque`, or `std::unique_ptr<Node>` ele
 would remove the trap. But `nodes` is a public member used directly in dozens of places,
 including the Python bindings, so that's a separate change.
 
+On Windows, `Backends/NodesCore.*` now passes on both backends, the six changed tests
+included.
+
 ### #3946: the pinned-memory test hang
 
-**Likely.** The test closed a gate (a `cudaLaunchHostFunc` that spins), then blocked in
-`cudaStreamSynchronize` on an independent stream. On Windows that copy never completed
-behind the spinning host function. Two changes:
+**Fixed; the exact cause is still Likely.** The test closed a gate (a `cudaLaunchHostFunc`
+that spins), then blocked in `cudaStreamSynchronize` on an independent stream. On Windows
+that copy never completed behind the spinning host function. Two changes:
 
 - **No blocking while the gate is closed.** The D2H use of the block now finishes before
   the gate closes. While it is closed, the test waits for `d2h_stream` with a 10-second
@@ -133,55 +157,47 @@ behind the spinning host function. Two changes:
   `cudaHostAlloc`, and CUDA's implicit-synchronization rules cover page-locked
   allocations.
 
-The assertions are unchanged.
+The assertions are unchanged. On Windows all 20 `TensorMultiStreamTest` tests now pass,
+in 5 seconds. Which of the two calls hung wasn't tested: the test now avoids both.
 
 ### #3947: CUDA connected components read past the union-find array
 
-**What the code shows (confirmed):**
+**Confirmed: a compiler bug in CUDA 12.8.0.** For sm_100 and sm_120, nvcc 12.8.0
+(V12.8.61) compiles `flatten_components` (`spatial_components.cuh`) so that the first load
+of the root walk in `finalComponentRoot` (`point_spatial.hpp`) reads `parent[4 * i]`
+instead of `parent[i]`. The index is sign-extended and multiplied by 4 before the loop,
+then the loop multiplies it by 4 again; later iterations use the right index. CUDA 12.8
+Update 1 (V12.8.93), 12.9 and 13.0 compile the same code correctly, and sm_90 isn't
+affected.
 
-- The union kernels (`union_components`, `point_tree_union`) only ever point a root at a
-  smaller index, and path halving only writes ancestors.
-- `next[i]` is written for every point that enters a hash chain, and only those are
-  followed.
-- So no kernel can write a parent outside the array. An out-of-range parent can only come
-  from `parent`, which is the `labels` tensor, holding something other than its
-  initialization `[0, 1, …, n−1]` when the kernels read it.
-- That matches initcheck ("reads entries of the `parent` array that were never written").
-- It also matches the one address in the issue: subtracting 4 × `0x3F800000` (the bits of
-  `1.0f`) from it gives a cleanly aligned base. That fits stale float data, or the
-  `cumsum − 1` result before its cast to Int32.
+- The labels going into the kernels are right: read back just before the launch they are
+  `0, 1, 2, …`, and the kernels fail the same way on plain `cudaMalloc` buffers. So this
+  isn't a stream-ordering problem. The `init_components` kernel the first version of this
+  branch added changed nothing (memcheck still found the same 370 errors).
+- For `i ≥ n / 4` the first load is past the end of the array, which is what memcheck
+  reports. A wrong first ancestor can also tie labels into loops.
+- The wrong code is already in the PTX, so it comes from NVVM, not ptxas. Of the 95 CUDA
+  sources compiled to PTX with 12.8.0 for sm_120, only `flatten_components` has the
+  pattern. Built with `-O0 -G`, the kernels are correct.
+- CI installs 12.8.0. The nightly builds are PTX-only for compute_75 and compile
+  correctly; native sm_100 and sm_120 builds with 12.8.0 are affected.
 
-**The change:** `launch_radius_connected_components` and `launch_point_tree_components`
-now write `parent[i] = i` themselves, with a new `init_components` kernel. It runs on the
-stream the union and flatten kernels use, right before them
-(`src/core/tensor/backend/cuda/kernels/tensor_spatial.cu`). Both callers in
-`tensor_spatial.cpp` pass exactly that identity, so nothing else changes. CPU, Vulkan and
-HIP are untouched.
+**The change:** `finalComponentRoot` walks on unsigned indices (labels are never
+negative), which 12.8.0 compiles correctly. `tensor_spatial.cu` is back to dev's version,
+without `init_components`. The HIP path has its own walk and the CPU path doesn't call
+this one, so neither changes.
 
-**Open:** why `labels` wasn't initialized on that stream. `tensor_spatial.cpp` builds it
-as `(allocate_like(..., Int32, 1.0f).cumsum(0) - 1).to(Int32)`. That is a deferred
-expression, materialized by `pin_operands`, and the kernels run on `labels.stream()`. If
-the materializer runs on a different stream from the one `labels.stream()` reports, or
-the lazy-executor materialization cache hands back a result produced elsewhere, other
-code using this pattern is exposed too. To check:
-
-1. Run the #3947 filter above with `CUDA_LAUNCH_BLOCKING=1` on the commit before this
-   branch's fix (`f1ad7d687`). If the failures disappear, it is an ordering race.
-2. On this branch, the filter should pass and compute-sanitizer should report nothing. If
-   labels are still wrong, look for a late write to `labels` from another stream: log
-   `labels.stream()` and `getCurrentCUDAStream()` in `radius_connected_components`, and
-   compare with the stream `materialize_deferred_slow` binds.
-3. Add a small test next to `tests/test_tensor_stream.cpp`'s late-initialization test:
-   build `(Tensor::full({n}, 1, GPU, Int32).cumsum(0) - 1).to(Int32)` on one stream, read
-   it from a kernel on `labels.stream()`, and check that it equals `[0, n)`.
-
-The reporter didn't try CUDA on Linux, so this may not be Windows-specific.
+**On Windows:** every connected-components test passes on CUDA, including
+`EveryRegisteredBuiltinEvaluatesOnSyntheticGeometry/CUDA`, which used to crash, and
+compute-sanitizer memcheck and initcheck report no errors (370 to 1,019 before). The
+details, with a reproduction without LichtFeld headers, are in a comment on #3947, which
+also asks the maintainers whether to raise the minimum CUDA Toolkit instead.
 
 ### #3948: files still open
 
-**Confirmed for all of these.** Windows can't delete a file, or rename over it, while a
-handle to it is open without `FILE_SHARE_DELETE`, and MSVC streams and memory maps don't
-share delete.
+**Confirmed for all of these, and all pass on Windows.** Windows can't delete a file, or
+rename over it, while a handle to it is open without `FILE_SHARE_DELETE`, and MSVC streams
+and memory maps don't share delete.
 
 | Test | Held file | Change |
 | --- | --- | --- |
@@ -193,17 +209,22 @@ share delete.
 | `SsogFormat.BundleCancellationPreservesDestination` | `scene.ssog` (`file`), removed mid-test | Same |
 | `PlyToRadLod.OutOfCoreLoadKeepsTreeAndStreamsChunks` | `synthetic.rad.meta`, memory-mapped by the out-of-core model `partial` (`MappedFile` opens with `FILE_SHARE_READ` only) | The models live in a block that ends before `remove_all` |
 | `RadMetaSidecar.RoundtripQuantizationAndInvalidation` | `sidecar.rad.meta`, mapped by `view` while the test rebuilds the sidecar over it | `view` lives in a block that ends before the rebuild |
-| `RadMetaSidecar.ConverterEmitsSidecarInline`, `RadSparkPagingTest.StreamedExportOpensInThePagedViewer`, `RadLodLeaves.OutOfCoreModelRefusesToFlatten` | The temp sidecar, held by the builder's own workers | **Product fix:** `build_rad_meta_sidecar` closes each TBB worker's stream on the temp file before the rename. They were only flushed (`src/io/formats/rad.cpp`) |
+| `RadMetaSidecar.ConverterEmitsSidecarInline`, `RadSparkPagingTest.StreamedExportOpensInThePagedViewer`, `RadLodLeaves.OutOfCoreModelRefusesToFlatten` | The temp sidecar, held by the builder's own workers | **Product fix:** `build_rad_meta_sidecar` closes each TBB worker's stream on the temp file before the rename. They were only flushed (`src/io/formats/rad.cpp`). `ConverterEmitsSidecarInline` then failed for a second reason, below |
 | `UserPathsContractTest.ConcurrentAtomicWritesDoNotShareTemporaryFiles` | `preferences.json`, the destination of eight concurrent commits | **Product fix:** the Windows commit in `src/core/atomic_file.cpp` called `MoveFileExW` once. It now retries access denied, sharing and lock violations 20 × 50 ms, like `native_fs::rename`. This affects users: preferences, UI state, projects and image outputs all go through it |
 
-The three RAD tests in the second-to-last row weren't traced individually. If one still
-fails, the exception names the file, and `handle64 -p lichtfeld_tests.exe` shows the
-holder.
+**The RAD sidecar header padding (confirmed product bug).** With the files closed,
+`ConverterEmitsSidecarInline` found that the sidecar written during conversion and a
+rebuilt one differ. A probe that kept both files found exactly 4 differing bytes out of
+5.8 MB, at offsets 90–93, in all three runs: the tail padding of the 96-byte
+`RadMetaHeader`, which is written to disk byte for byte. GCC happens to leave those bytes
+zero; MSVC leaves whatever was in memory there. The padding is now a member,
+`std::uint8_t reserved[6]{}`, so it is always written as zeros. The layout and size don't
+change, so existing sidecars still load.
 
 ### #3948: paths, Unicode and case
 
-All of these are **confirmed** test bugs. The product code goes through `native_fs` and
-the UTF-8 path helpers correctly.
+All of these are **confirmed** test bugs, and all pass on Windows. The product code goes
+through `native_fs` and the UTF-8 path helpers correctly.
 
 | Test | Cause | Change |
 | --- | --- | --- |
@@ -226,23 +247,23 @@ and `utf8_to_path` doesn't need the explicit length.
 
 | Test | Cause | Change |
 | --- | --- | --- |
-| `UsdHalfTest.RoundTripAndRoundingMatchIEEE754` | **Confirmed.** The test's own reference converter was wrong, not `float_to_half`. MSVC has no `_Float16`, so it uses the fallback, which ORed a mantissa that still has its implicit bit into the exponent | The fallback adds it. It matches hardware `_Float16` on 611 million values on Linux |
+| `UsdHalfTest.RoundTripAndRoundingMatchIEEE754` | **Confirmed.** The test's own reference converter was wrong, not `float_to_half`. MSVC has no `_Float16`, so it uses the fallback, which ORed a mantissa that still has its implicit bit into the exponent | The fallback adds it. It matches hardware `_Float16` on 611 million values on Linux, and the test passes on Windows |
 | `SceneGraphIdentityTest.SceneInfoSourcePathIsMostRecentlyAddedNode` | **Confirmed product bug.** `getSceneInfo()` reported `splat_paths_.begin()` of an `unordered_map`, so the result depended on hash order on every platform | Picks the path of the node with the highest id (`scene_manager.cpp`) |
 | `UserPathsContractTest.PortableRoot*` (2) | `LFS_HOME` takes precedence over the portable root | Both tests clear `LFS_HOME` |
 | `ViewerGpuMemory.CudaStatusKeepsDeviceUsageAndItsOptionalUtilizationReading` | **Confirmed.** On Windows `process_budget` is the DXGI local budget, by design (`GpuMemoryQuery.OversubscriptionIsExplicitAndDeviceUsageIsPhysical` expects it) | The `== 0` check is Linux-only |
-| `SessionBreadcrumbTest.SnapshotsOnlyTheUncleanPreviousLogTail` | **Likely.** The breadcrumb resolves its log through `UserPaths`, which honours `LFS_HOME`. `Logger::default_log_file_path()` ignores it, so with `LFS_HOME` set the two point at different files | `HomeDirectoryGuard` clears `LFS_HOME`. The product side is in [Still open](#still-open) |
-| `TensorReserveInplaceCatCuda.AllocationFailurePreservesInstalledStorage` | **Likely.** Under WDDM, the driver's sysmem fallback lets `cudaMalloc` go past dedicated memory into shared system memory, so "total memory + 4 bytes" succeeds | It asks for 256 TiB. To confirm, set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" for `lichtfeld_tests.exe`: the old test then passes |
-| `CameraModels/GutScreenShare.*/4` (4), `GsplatRasterizerQuantTest.DecodedFp32AndQ16AreBitwiseEqualAcrossBandsAndWarmup` | **Confirmed product bug, on every platform.** `Camera`'s move constructor and move assignment (`src/core/camera.cpp`) copied every member except `_camera_model_type` and `_has_alpha`. A moved thin-prism or fisheye camera became a pinhole camera that kept its 4 radial coefficients, and the PINHOLE validation (since #2683) throws "Pinhole cameras require at most three polynomial radial coefficients…". The tests pick their camera with `cond ? make_a() : make_b()`. GCC and Clang build that in place, while MSVC appears to move it (Likely), which is why only Windows saw it. `_has_alpha` was also missing from the transform copy, so a moved camera stopped using its alpha as a mask | Both members are copied, and the new `CameraMove.KeepsModelTypeAndAlpha` test (CPU only) covers it. Expect `GutScreenShare.*/2` (fisheye) and `/3` (equirectangular) to change on Windows: they ran as pinhole before and passed, and now really use their models |
-| `LpipsOpsTest.RejectsOperandDtypesBeforeLaunching` | **Likely.** The test looks for `convolution` in the host stack trace. On MSVC, internal-linkage functions only resolve with private PDB symbols, which a Release `lfs_training` doesn't have. The test's own frame has an external name, so it resolves | The operand checks now name their operation ("CUDA LPIPS convolution output must be…"), so the report says it without symbols. This also helps Release diagnostics |
+| `SessionBreadcrumbTest.SnapshotsOnlyTheUncleanPreviousLogTail` | **Confirmed** (passes on Windows with the change). The breadcrumb resolves its log through `UserPaths`, which honours `LFS_HOME`. `Logger::default_log_file_path()` ignores it, so with `LFS_HOME` set the two point at different files | `HomeDirectoryGuard` clears `LFS_HOME`. The product side is in [Still open](#still-open) |
+| `TensorReserveInplaceCatCuda.AllocationFailurePreservesInstalledStorage` | **Likely.** Under WDDM, the driver's sysmem fallback lets `cudaMalloc` go past dedicated memory into shared system memory, so "total memory + 4 bytes" succeeds | It asks for 256 TiB, and passes on Windows. To confirm the cause, set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" for `lichtfeld_tests.exe`: the old test then passes |
+| `CameraModels/GutScreenShare.*/4` (4), `GsplatRasterizerQuantTest.DecodedFp32AndQ16AreBitwiseEqualAcrossBandsAndWarmup` | **Confirmed product bug, on every platform.** `Camera`'s move constructor and move assignment (`src/core/camera.cpp`) copied every member except `_camera_model_type` and `_has_alpha`. A moved thin-prism or fisheye camera became a pinhole camera that kept its 4 radial coefficients, and the PINHOLE validation (since #2683) throws "Pinhole cameras require at most three polynomial radial coefficients…". The tests pick their camera with `cond ? make_a() : make_b()`. GCC and Clang build that in place, while MSVC appears to move it (Likely), which is why only Windows saw it. `_has_alpha` was also missing from the transform copy, so a moved camera stopped using its alpha as a mask | Both members are copied, and the new `CameraMove.KeepsModelTypeAndAlpha` test (CPU only) covers it. `GutScreenShare.*/2` (fisheye) and `/3` (equirectangular) ran as pinhole before; they now really use their models, and all of these pass on Windows |
+| `LpipsOpsTest.RejectsOperandDtypesBeforeLaunching` | **Confirmed.** The test looks for `convolution` and for its own name in the host stack trace. A Release build on Windows has no PDB, so `std::stacktrace` names only the nearest exported functions: neither the LPIPS checks nor the test body (in an anonymous namespace) can be named | The operand checks now name their operation ("CUDA LPIPS convolution output must be…"), so the report says it without symbols, which also helps Release diagnostics. The test looks for its own name only on other platforms. It passes on Windows |
 
 ## Still open
 
 ### Product gaps found along the way
 
-- **`HostMetrics.CpuAndPerCoreBecomeValidAfterSecondSample`.** **Confirmed.** CPU sampling
-  in `src/core/host_metrics.cpp` exists only for POSIX (it reads `/proc`). The Windows
-  branch only sizes `per_core_cpu_percent` to −1, so the HUD always shows "--" for CPU on
-  Windows. Implement `read_cpu` with:
+- **`HostMetrics.CpuAndPerCoreBecomeValidAfterSecondSample`.** **Confirmed** (on Windows
+  `process_cpu_percent` is −1). CPU sampling in `src/core/host_metrics.cpp` exists only
+  for POSIX (it reads `/proc`). The Windows branch only sizes `per_core_cpu_percent` to
+  −1, so the HUD always shows "--" for CPU on Windows. Implement `read_cpu` with:
   - `GetProcessTimes` for the process;
   - `GetSystemTimes` for the system (its kernel time includes idle);
   - `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` for each core.
@@ -259,25 +280,37 @@ and `utf8_to_path` doesn't need the explicit length.
 
 ### Need one experiment each
 
+- **`CustomEffectTest.QuantizedPagePoolDrawsMatch`** (`vksplat_custom_effect_tests`, Open).
+  The program didn't build on Windows before, so this was the first Windows run of its
+  tests, and the other 16 pass.
+  - **What happens:** about 100 ms in, the test throws a `std::exception` whose message is
+    just "unknown error".
+  - **Ruled out:** the LOD model setup and the plain draws. A probe that builds both LOD
+    models and draws every path twice, with and without RAD opacity, ran without an
+    exception.
+  - **Experiment:** repeat the rest of the test step by step (the reveal cases, the moved
+    oracles, then the custom-effect draws), catching the exception and printing its type.
 - **`NvCodecSentinelValidatorTest.SkippedMemberIsRetriedOrFailsHardBeforeReturn`** (Likely).
   - **Suspected cause:** the test compares two different JPEG decoders bit for bit. When
     `nvjpegCreateEx(NVJPEG_BACKEND_HARDWARE)` succeeds, the first member goes to the
     hardware JPEG engine (registered at VERY_HIGH priority). The retried member goes
     through the CUDA decoder (`nvcodec_image_loader.cpp`, the HYBRID_CPU_GPU retry
     decoder).
+  - **On Windows:** the first 32 values printed match, so the decoded images differ
+    further in.
   - **Experiment:** print the mismatch count and the largest difference. A few levels of
     rounding confirms this; a leftover sentinel differs everywhere.
   - **Fix if confirmed:** compare with a PSNR threshold (> 40 dB) instead of `EXPECT_EQ`.
-- **`VideoFrameExtractorTrim.SparseFpsStopsAtTheLastDecodableFrameInAStreamCopy`** (Likely).
-  - **Suspected cause:** "sequential" means `chooseFrameSelection` decided before any
-    seek. FFmpeg is pinned to the same version on both platforms, so the input that can
-    differ is `using_hw_decode`: NVDEC probably didn't take the 64×48 fixture.
-  - **Experiment:** run it alone and read the "Frame selection: sequential (reason=…)"
-    line, any `h264_cuvid` errors, and `processing.decoder.backend` in
-    `extraction_metadata.json`.
-  - **Fix:** if it's the software fallback, expect "sequential" when the backend isn't
-    NVDEC, or regenerate the fixture at 128×128 with the same timestamps.
-- **`VideoExportUtilsTest.EquirectangularMarkerPixelsFollowViewportCamera`** (flaky, Open).
+- **`VideoFrameExtractorTrim.SparseFpsStopsAtTheLastDecodableFrameInAStreamCopy`** (Confirmed).
+  - **Cause:** "sequential" means `chooseFrameSelection` decided before any seek, and the
+    log on the RTX 5090 shows why: `h264_cuvid` refuses the fixture ("Video height 48 not
+    within range from 64 to 8192"), the extractor falls back to the software decoder, and
+    picks "sequential (reason=software_decoder_requires_sequential_decode)". NVDEC's
+    minimum size depends on the GPU, so this depends on the card rather than on Windows.
+  - **Fix:** expect "sequential" when the decoder backend isn't NVDEC, or regenerate the
+    fixture at 128×128 with the same timestamps, so that NVDEC takes it on every card.
+- **`VideoExportUtilsTest.EquirectangularMarkerPixelsFollowViewportCamera`** (flaky, Open). It
+  passed in both full runs on Windows here.
   - **What was ruled out:** the readback waits on the render timeline and invalidates
     before copying, and no unsynchronized readback was found.
   - **Experiments:**
@@ -303,7 +336,7 @@ and the opt-in self-hosted GPU job runs only node and spatial tests.
 - `TrainingOpsGeometryParity.LargeUnweightedImagesVulkan`
 - `Backends/TrainingOpsFamilyParity.MatchesCuda/Photometric_Vulkan`
 
-All are in `tests/test_training_ops_parity.cpp`.
+All are in `tests/test_training_ops_parity.cpp`, and all still fail on Windows, alone too.
 
 **Ruled out by reading:**
 
@@ -355,8 +388,9 @@ from the Fast tests, not Photometric:
 
 **`MaskedSSIMMetricTest.AllSupportedMapsMatchUnmaskedMaps`** (Vulkan run only, Likely):
 
-- **What differs:** 0.98671073 against 0.98671055, which is 3 ULP. The two arms run the
-  same `photometric_fused` shader with different specialization constants, so the driver
+- **What differs:** 0.98671073 against 0.98671055, which is 3 ULP. The Windows run here
+  gave exactly these values again, at element 2. The two arms run the same
+  `photometric_fused` shader with different specialization constants, so the driver
   compiles two pipelines, and the shared unweighted arithmetic isn't `precise`.
 - **Experiment:** temporarily change the `ASSERT_EQ` at
   `tests/test_masked_ssim_metrics.cpp:172` to `EXPECT_EQ`, and count the differing
@@ -385,6 +419,7 @@ training with the normal loss):
   and `BackwardNormalRotationGradientUsesCompactVisibleIndex` (the gradient is 0 where
   finite differences give −0.0429), and
   `NormalLossRegression.OffCenterOverlappingFullFusedGradients` (3.162 against −0.0602).
+  All three still fail on Windows, alone too, with the same values.
 - **Ruled out:**
   - random inputs (the scenes are hard-coded);
   - `long` and `long double`;
@@ -427,7 +462,8 @@ training with the normal loss):
 - **Confirm:** compare the printed `HUNT codec mode=1 …` line with Linux. If `tiny_fp32`
   differs, the FP32 reference itself differs (`sinf` or `pow`).
 
-**`MeshDataTest.ProcessExitsCleanlyAfterMesh2Splat`** (Vulkan run, Likely, product bug):
+**`MeshDataTest.ProcessExitsCleanlyAfterMesh2Splat`** (Vulkan run, Likely, product bug). On
+Windows the death-test child exits with 0xC00000FD, a stack overflow:
 
 - **Cause:**
   - The death-test child builds the converter's output on the default tensor backend,
@@ -453,6 +489,7 @@ training with the normal loss):
 - **How the count works:** it includes freed-but-pending buffers, and the recorder batches
   up to 64 commands. This kernel passes its 5 words as push constants, so it shouldn't
   allocate at all.
+- **On Windows:** 5 live VMA objects against 2 before (+3), alone too.
 - **Experiment:** run it alone with `--gtest_repeat=3`.
   - +3 on the first repetition only means objects created on first use. That's a test
     bug: launch once, `synchronize_device()` and trim before taking `before`, then
@@ -462,7 +499,8 @@ training with the normal loss):
     who allocates.
 
 **`lichtfeld_tests` exits with 0xC0000005 after the report** (mechanism confirmed, product
-bug: the app exits the same way):
+bug: the app exits the same way). In the full runs here, the Vulkan run exited this way
+and the CUDA run didn't.
 
 - **Cause:** DLL static destructors run after the drivers shut down, as above. One
   example: the static `RandomGenerator` owns a cuRAND generator, and `~CudaRandomState`
