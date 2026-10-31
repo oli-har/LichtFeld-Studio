@@ -215,21 +215,12 @@ namespace lfs::core::tensor_ops {
     } // namespace
 
     namespace {
-        // Union-find starts from parent[i] = i. Writing that on the stream the joins and the flatten
-        // run on keeps them from reading labels whose initialization has not reached this stream: a
-        // parent outside the array sends flatten_components out of bounds (#3947).
-        __global__ void init_components(int32_t* parent, const size_t count) {
-            const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-            if (i < count)
-                parent[i] = static_cast<int32_t>(i);
-        }
+
     } // namespace
 
     void launch_point_tree_components(const float* points, const float* sorted, const float* boxes, const float* box_radii,
                                       const int32_t* visit, const float* sorted_radii, const float* radii, int32_t* labels,
                                       const PointTreeProgram& tree, const cudaStream_t stream) {
-        init_components<<<(tree.points + kBlockSize - 1) / kBlockSize, kBlockSize, 0, stream>>>(labels, tree.points);
-        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.point_tree_components.init");
         point_tree_union<<<(tree.references + kBlockSize - 1) / kBlockSize, kBlockSize, 0, stream>>>(
             points, sorted, boxes, box_radii, visit, sorted_radii, radii, labels, tree);
         LFS_CUDA_LAUNCH_CHECK(stream, "tensor.point_tree_components.union");
@@ -321,8 +312,6 @@ namespace lfs::core::tensor_ops {
         const auto blocks = static_cast<unsigned int>((count + kBlockSize - 1) / kBlockSize);
         build<<<blocks, kBlockSize, 0, stream>>>(points, references, heads, next, count, bucket_mask, radius, 0);
         LFS_CUDA_LAUNCH_CHECK(stream, "tensor.radius_connected_components.build");
-        init_components<<<blocks, kBlockSize, 0, stream>>>(labels, count);
-        LFS_CUDA_LAUNCH_CHECK(stream, "tensor.radius_connected_components.init");
         union_components<<<blocks, kBlockSize, 0, stream>>>(points, references, heads, next, labels, count, bucket_mask, radius);
         LFS_CUDA_LAUNCH_CHECK(stream, "tensor.radius_connected_components.union");
         flatten_components<<<blocks, kBlockSize, 0, stream>>>(labels, count);
