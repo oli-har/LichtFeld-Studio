@@ -1181,6 +1181,8 @@ namespace lfs::vis {
         // which takes render_mutex_ exclusively. Keep it off the caller thread
         // so startTraining() can acknowledge Starting while that mutex is used
         // to gate initialization.
+        if (auto* pm = services().paramsOrNull())
+            applied_param_serial_.store(pm->dirtySerial(), std::memory_order_relaxed);
         if (auto applied = applyPendingParams(); !applied) {
             return lfs::Result<void>::failure(
                 std::move(applied).error().with_context(
@@ -2217,7 +2219,15 @@ namespace lfs::vis {
         LOG_TIMER("Training execution");
 
         trainer_->setOnIterationStart([this] {
-            if (auto* pm = services().paramsOrNull(); pm && pm->consumeDirty()) {
+            auto* pm = services().paramsOrNull();
+            if (!pm)
+                return;
+            // Saving the project clears the dirty flag, so the flag alone missed edits made just
+            // before a save, such as a new save step (#1651). The edit serial does not.
+            const bool dirty = pm->consumeDirty();
+            const auto serial = pm->dirtySerial();
+            if (dirty || serial != applied_param_serial_.load(std::memory_order_relaxed)) {
+                applied_param_serial_.store(serial, std::memory_order_relaxed);
                 if (auto applied = applyPendingParams(); !applied) {
                     auto typed = std::move(applied).error();
                     last_error_ = typed.user_message().empty()

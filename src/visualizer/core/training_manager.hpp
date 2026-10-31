@@ -352,6 +352,8 @@ namespace lfs::vis {
         std::condition_variable initialization_gate_cv_;
         bool initialization_gate_open_ = true;
         bool initialization_main_step_failed_ = false;
+        // ParameterManager edit serial the trainer last applied; see setOnIterationStart.
+        std::atomic<std::uint64_t> applied_param_serial_{0};
         std::atomic<bool> initialization_pause_requested_{false};
         std::jthread completion_reaper_;
         // Handlers capture this, so the destructor removes them from the process-wide bridge.

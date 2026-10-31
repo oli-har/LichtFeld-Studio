@@ -20,7 +20,11 @@ so nothing has been run. The confidence marks are the same as in the Windows pla
 | [#2783](https://github.com/MrNeRF/LichtFeld-Studio/issues/2783) | CVT1100 duplicate VERSION resource | Already fixed by #3198; can be closed |
 | [#1569](https://github.com/MrNeRF/LichtFeld-Studio/issues/1569) | Source builds have no uv, so plugin installs fail | Partly fixed, plan |
 | [#3205](https://github.com/MrNeRF/LichtFeld-Studio/issues/3205) | Windows build instructions | Partly fixed, plan |
-<!-- MORE-ROWS -->
+| [#3940](https://github.com/MrNeRF/LichtFeld-Studio/issues/3940) | `--enable-mip` ignored with `--gut` | `dev` already refuses the combination; a related timelapse bug fixed; plan for mip in 3DGUT |
+| [#2135](https://github.com/MrNeRF/LichtFeld-Studio/issues/2135) | Mesh to Splat changes orientation | No code difference between CLI and GUI; plan for an `--up-axis` option |
+| [#1651](https://github.com/MrNeRF/LichtFeld-Studio/issues/1651) | Save steps ignored | One cause fixed, one planned |
+| [#1756](https://github.com/MrNeRF/LichtFeld-Studio/issues/1756) | 0.5.3 checkpoint can't be resumed | Plan, cause confirmed; needs a maintainer decision |
+| [#1786](https://github.com/MrNeRF/LichtFeld-Studio/issues/1786) | MCP bind failure invisible | Already visible since #1658; plan for the identity part |
 
 ## #3876: RAD import runs out of VRAM before paging is chosen
 
@@ -312,4 +316,205 @@ the toolchain file, and checks that `VCPKG_ROOT` really holds vcpkg (top of
 - `vcpkg env --triplet x64-windows "echo %VSINSTALLDIR%"` shows which installation the
   ports use. Check that `<it>\VC\Tools\Llvm\x64\bin\clang-cl.exe` exists.
 
-<!-- MORE-SECTIONS -->
+## #3940: `--enable-mip` ignored with `--gut`
+
+**On `dev` the combination is already refused.** Since #2048 (`06c8c677b`),
+`training_backend.hpp` marks the mip filter unsupported for 3DGUT, and `validate()`
+returns "3DGUT cannot be used with Mip Filter. Change this setting or select 3DGS."
+That covers the CLI, the trainer, the GUI (which also greys out the checkbox) and
+checkpoint loads. The issue's line numbers match `master`, which doesn't have the check:
+cherry-pick `06c8c677b` there, or add it next to the igs+ conflict in `parameters.cpp`.
+
+**A correction to the issue (confirmed): passing the flag through would change nothing in
+the image.**
+
+- In the 3DGUT path, `eps2d` (0.3) and the compensation feed only culling and tile
+  extents (`ProjectionUT3DGSFused.cu`). The `compensations` buffer is never read.
+- The pixel kernels evaluate the raw 3D Gaussian with raw opacity, forward and backward.
+  Vulkan, Metal and the viewer's GUT renderer do the same.
+- So `--gut` trains with no screen-space filter at all, not with the 0.3 px² dilation.
+- A side effect (Likely): culling uses opacity scaled by the 0.3 compensation while the
+  pixels use raw opacity, so some sub-pixel splats are culled that the evaluator would
+  draw.
+
+**Fixed on this branch (a related bug on `dev` and `master`).** The 3DGS timelapse rendered
+with `mip_filter = false` (`trainer.cpp`), so timelapse frames of `--enable-mip` runs used
+the 0.3 px² dilation without compensation. It now passes `step_params.mip_filter`, as the
+evaluation render does.
+
+**Plan for mip with 3DGUT:**
+
+1. Rename `antialiased` to `mip_filter` through `GsplatParams`, `gsplat_render` and
+   `gsplat_infer`, and pass it at all six 3DGUT call sites:
+   - the evaluation render, training step and timelapse in `trainer.cpp`;
+   - `trainer_popspa.cpp`;
+   - two in `metrics.cpp`.
+2. Use `eps2d = mip ? 0.1f : 0.3f`, and compute compensations when mip is on.
+3. **Projection.** Inflate the scales by the world-space variance of 0.1 px² at the
+   mean's depth: σw² = 0.1·(z/f)², with f chosen per camera model. The compensation is
+   sqrt(det(s) / det(s′)).
+4. **Pixel forward.** Evaluate with s′ and multiply the opacity by the compensation.
+5. **Backward.** Use the same s′ and compensation:
+   - multiply the scale gradient by s/s′;
+   - multiply the opacity gradient by the compensation;
+   - treat the compensation as stop-gradient, as fastgs does.
+6. The same in Vulkan, Metal and the viewer's GUT renderer, or the viewer won't match
+   training.
+7. Mark it supported in `training_backend.hpp`, and update `test_training_parameters.cpp`
+   and `training_panel.py`.
+
+**The two fastgs inconsistencies in the issue are real:**
+
+- **(a) The backward compensation threshold.** In `kernels_backward.cuh`, replace the
+  `det_raw > min_cov2d_determinant` branch with what the forward pass does:
+  ```cpp
+  const float det_raw = fmaxf(raw_a * raw_c - raw_b * raw_b, 0.0f);
+  opacity_compensation = sqrtf(det_raw * determinant_rcp);
+  ```
+  The same change applies to Vulkan `fast_projection_backward.slangh` and Metal
+  `fast_backward.metal`.
+- **(b) `dilation_scale` missing in backward.** This is latent today: only evaluation
+  forwards use a scale other than 1, and they have no backward. Either thread it through
+  `preprocess_backward_cu`, `backward()`, `backward_raw()` and `CudaFastFrame`, and the
+  Vulkan and Metal backward, or assert scale == 1 in `fast_ops_backward`.
+
+**Verify:**
+
+- On `dev`, `LichtFeld-Studio -d <colmap> -o out --gut --enable-mip -i 100 --headless`
+  exits with the conflict error.
+- Compare a timelapse frame of a 3DGS `--enable-mip` run with an evaluation render at the
+  same step.
+- Add finite-difference checks for (a) and (b): `MipFilter_Enabled` in
+  `tests/test_fastgs_fuzz.cpp`, with a needle-shaped splat whose determinant is between 0
+  and 1e-6.
+
+## #2135: Mesh to Splat changes orientation
+
+**There's no code difference between the paths (confirmed).**
+
+- The CLI `mesh2splat` and the GUI use the same loader (the same assimp flags, with node
+  transforms baked into both since #3285) and the same converter.
+- The converter applies no axis conversion.
+- `tests/test_mesh_loader.cpp` checks the CLI chain.
+
+The reporter's last comment says "Case closed".
+
+**What differs (Likely):**
+
+- The GUI result inherits the mesh node's transform. Users often rotate imported meshes,
+  because LFS stores data Y-down and flips it for display.
+- Dragging a splat out of the GUI applies an up-axis rotation (+Z up for Blender, which
+  is 90° about X). The CLI doesn't.
+- Builds before 2026-10-11 also dropped glTF/FBX node rotations in both paths.
+
+**Plan:**
+
+- Add `--up-axis {-y,+y,-z,+z}` (default `-y`, which is identity) to `mesh2splat` and
+  `convert`. Reuse `SplatDragAxes::matrix()` after moving it to core.
+- Document that conversion keeps mesh coordinates.
+- The remaining request, starting training from a loaded mesh or splat, is a feature
+  request.
+
+**Verify:**
+
+1. Import a glb, convert it in the GUI and export a PLY; run `mesh2splat x.glb -o cli.ply`.
+   The two should be equal.
+2. Rotate the mesh node, convert and export again: the export differs by exactly that
+   rotation.
+
+## #1651: save steps ignored
+
+**How save steps work.**
+
+- Steps come from the training panel, the status-bar markers, or `save_steps` in
+  parameter JSON or a `.licht`. There's no CLI flag.
+- A step saves when the trainer may save at a step boundary, which needs a bound `.licht`.
+  Otherwise it is skipped with only `LOG_DEBUG`.
+- With "Keep all checkpoints" off (the default), each checkpoint replaces the previous
+  one.
+
+**Two causes, both confirmed:**
+
+1. **Fixed on this branch.**
+   - **The bug:** the trainer picked up GUI edits only through the ParameterManager dirty
+     flag. That is also the project's "unsaved changes" flag, which every explicit save
+     clears. So pausing, adding a step, pressing Ctrl+S and resuming meant the trainer
+     never got the step, while the panel and status bar showed it.
+   - **The fix:** the trainer now also tracks `dirtySerial()`, so an edit is applied even
+     after a save has cleared the flag (`training_manager.cpp`, `training_manager.hpp`).
+     The flag is still consumed as before, so save prompts don't change.
+2. **Plan.** `--resume project.licht` (headless) takes its parameters from the
+   checkpoint, and re-reads only `keep_all_checkpoints` from the saved project
+   (`training_setup.cpp`). So save steps edited after the last checkpoint are ignored.
+   Add `ParametersChapter::save_steps(strategy)` next to `checkpoint_retention` and apply
+   it unless the command line overrides it.
+
+Also, log skipped step saves at INFO instead of DEBUG.
+
+**Verify:**
+
+1. Turn on "Keep all checkpoints" and start training.
+2. Pause around iteration 2000, add a step at 3000, press Ctrl+S and resume.
+3. After 3000, `LichtFeld-Studio licht p.licht --checkpoints` should list 3000.
+
+## #1756: a 0.5.3 checkpoint can't be resumed
+
+**Cause (confirmed): it always fails for 0.5.3 checkpoints.**
+
+- 0.5.3 wrote Adam state version 2: uint8 moments with per-row scales.
+- That codec was removed in #1588 (`9169a2a00`), and `AdamOptimizer::deserialize` throws
+  "AdamOptimizer checkpoint uses removed legacy moment codec; retrain or convert to joint
+  (u,log_s) checkpoints".
+- By then the scene manager has already cleared the scene and loaded the dataset, hence
+  "the dataset loads, then an error".
+- Model-only import (`convert x.resume`, `CheckpointLoader`) still works. That is what
+  "can still be imported" means.
+
+**Also (Likely):** 0.5.3 parameter JSON has no `use_exposure_correction`, and `from_json`
+starts from the MRNF default, which is true. So 0.5.3 MRNF checkpoints silently get
+exposure correction, and ones with bilateral grid or PPISP fail validation.
+
+**Plan; the maintainers decide which:**
+
+- **Refuse early**, in the resume popup and before clearing the scene, with a clear
+  message, and offer to import the model instead.
+- **Or resume with fresh Adam moments:** for state version ≤ 2, read and discard the
+  state (which keeps the stream aligned) and log a warning.
+- **Or convert:** decode the old moments and re-encode them with the joint codec.
+
+Whichever is chosen:
+
+- Default a missing `use_exposure_correction` to false in `parse_checkpoint_params_json`.
+- Show the reason in the popup when reading the header or the parameters fails. Today
+  `read_checkpoint_params` drops the error, and the popup just doesn't appear.
+
+**Verify:** build 0.5.3 (`d8c50c6a3`), train about 1k iterations and save a checkpoint. On
+`dev`, drag it in, or run `--resume old.resume -d <dataset> --headless`: today this gives
+the Adam error.
+
+## #1786: MCP bind failure invisible
+
+**The reported part is already handled.**
+
+- Since #1658, a bind failure sets the MCP status to Failed.
+- The status bar then shows a red "MCP Error" ("could not listen on {addr}:{port}"), and
+  Preferences shows "Error".
+- `--mcp-port` came with #1797.
+- `docs/docs/development/mcp/connecting-clients.md` covers running two instances and
+  checking `serverInfo.version`.
+
+**What's left is the identity request.**
+
+- Add `_meta` to the `initialize` result, with `app.lichtfeld/pid`, `config_dir`, `port`
+  and the current project. Cache the project on open and save rather than querying it
+  from the HTTP thread.
+- Show the same PID in the status-bar MCP popup, and document the check.
+
+**Speculative, macOS only:** with `SO_REUSEADDR`, a second instance listening on `0.0.0.0`
+may coexist with one on `127.0.0.1`, showing a healthy chip while loopback clients reach
+the first instance. Check this on a Mac.
+
+**Verify:**
+
+- Start two instances on the same port: the second shows the red chip.
+- After the change, `initialize` on 127.0.0.1:45677 returns the first instance's PID.

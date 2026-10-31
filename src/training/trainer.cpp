@@ -8421,7 +8421,7 @@ namespace lfs::training {
                                 } else {
                                     rendered_timelapse_output = fast_infer(
                                         *training_ops_->fast, fast_saved_, *cam_to_use, strategy_->get_model(),
-                                        background_, false);
+                                        background_, step_params.mip_filter);
                                 }
 
                                 // Get folder name to save in by stripping file extension

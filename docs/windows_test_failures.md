@@ -29,8 +29,8 @@ Each cause below is marked:
 | #3945 | 5 node tests, plus 1 more found | Fixed in the tests |
 | #3946 | 1 | Fixed in the test |
 | #3947 | 8 node and tensor tests on CUDA | Fixed in the CUDA launch; one ordering question left to check |
-| #3948 | Open files, atomic writes (13) | Fixed: 11 tests, plus 2 product fixes (atomic commit retry, RAD sidecar) |
-| #3948 | Paths, Unicode, case (9) | Fixed in the tests |
+| #3948 | Open files, RAD sidecar, atomic writes (12) | Fixed: 8 test changes, plus 2 product fixes (RAD sidecar, atomic commit retry) |
+| #3948 | Paths, Unicode, case (7) | Fixed in the tests |
 | #3948 | `UsdHalfTest`, `LFS_HOME`, scene source path, camera node | Fixed (scene source path is a product fix) |
 | #3948 | `ViewerGpuMemory`, `SessionBreadcrumb`, `TensorReserveInplaceCat`, `LpipsOps` | Fixed (LPIPS by naming the operation in its messages) |
 | #3948 | `HostMetrics` | Plan: Windows never samples CPU usage (product gap) |
@@ -88,6 +88,7 @@ Tools that help:
 | Open files | `--gtest_filter=MetricsReporter.*:ViewEvaluationJson.*:MetricsEvaluatorControlTest.*:NormalAutoGenerateIntegration.*:PriorAutoGenerateIntegration.*:SsogFormat.*:PlyToRadLod.*:RadMetaSidecar.*:RadSparkPagingTest.*:RadLodLeaves.*` |
 | Atomic writes | `--gtest_filter=UserPathsContractTest.* --gtest_repeat=200` |
 | Paths and Unicode | `--gtest_filter=UnicodePathTest.*:CrashHandlerTest.*:PlyErrorTaxonomyTest.*:MissingDatasetImagesTest.*:VideoExtractorNamingUiTest.*` |
+| Camera move | `--gtest_filter=CameraMove.*:CameraModels/GutScreenShare.*:GsplatRasterizerQuantTest.*` |
 | Smaller fixes | `--gtest_filter=UsdHalfTest.*:SceneGraphIdentityTest.*:ViewerGpuMemory.*:GpuMemoryQuery.*:SessionBreadcrumbTest.*:TensorReserveInplaceCat*.*:LpipsOpsTest.*` |
 
 ## Fixed on this branch
