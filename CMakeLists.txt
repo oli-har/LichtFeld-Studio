@@ -7,8 +7,17 @@ set(RAW_VCPKG_PATH $ENV{VCPKG_ROOT})
 file(TO_CMAKE_PATH "${RAW_VCPKG_PATH}" VCPKG_ROOT)
 
 if ("${CMAKE_TOOLCHAIN_FILE}" STREQUAL "")
+    if ("${VCPKG_ROOT}" STREQUAL "")
+        message(FATAL_ERROR "vcpkg not found: set the VCPKG_ROOT environment variable to a bootstrapped clone of "
+                            "https://github.com/microsoft/vcpkg, or pass "
+                            "-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake")
+    endif()
     message(STATUS "user didn't specify CMAKE_TOOLCHAIN_FILE manually, so let's use default -> ${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
     set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+    if (NOT EXISTS "${CMAKE_TOOLCHAIN_FILE}")
+        message(FATAL_ERROR "VCPKG_ROOT ('${VCPKG_ROOT}') has no scripts/buildsystems/vcpkg.cmake: "
+                            "point it at a bootstrapped clone of https://github.com/microsoft/vcpkg")
+    endif()
 endif()
 
 cmake_minimum_required(VERSION 3.30)

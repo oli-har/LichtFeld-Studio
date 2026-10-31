@@ -143,16 +143,25 @@ function(fetch_uv)
     endif()
 endfunction()
 
-# Copy uv to build/bin/ for development builds
+# Copy uv to bin/ next to the development executable. The app looks in <exe dir>/bin, and
+# multi-config generators on Windows (Visual Studio) put the executable in build/<Config>.
 function(copy_uv_to_build)
     if(NOT EXISTS "${UV_BINARY_PATH}")
         return()
     endif()
 
-    set(_DEST_DIR "${CMAKE_BINARY_DIR}/bin")
-    file(MAKE_DIRECTORY "${_DEST_DIR}")
-    file(COPY_FILE "${UV_BINARY_PATH}" "${_DEST_DIR}/${UV_BINARY_NAME}" ONLY_IF_DIFFERENT)
-    message(STATUS "FetchUV: Copied uv to ${_DEST_DIR}/")
+    set(_DEST_DIRS "${CMAKE_BINARY_DIR}/bin")
+    get_property(_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(WIN32 AND _MULTI_CONFIG)
+        foreach(_CONFIG IN LISTS CMAKE_CONFIGURATION_TYPES)
+            list(APPEND _DEST_DIRS "${CMAKE_BINARY_DIR}/${_CONFIG}/bin")
+        endforeach()
+    endif()
+    foreach(_DEST_DIR IN LISTS _DEST_DIRS)
+        file(MAKE_DIRECTORY "${_DEST_DIR}")
+        file(COPY_FILE "${UV_BINARY_PATH}" "${_DEST_DIR}/${UV_BINARY_NAME}" ONLY_IF_DIFFERENT)
+        message(STATUS "FetchUV: Copied uv to ${_DEST_DIR}/")
+    endforeach()
 endfunction()
 
 # Function to install uv to the bin directory

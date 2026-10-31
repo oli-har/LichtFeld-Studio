@@ -3,6 +3,7 @@
 
 #include "io/pipelined_image_loader.hpp"
 #include "core/assert.hpp"
+#include "core/environment.hpp"
 #include "core/error_reporter.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
@@ -289,6 +290,13 @@ namespace lfs::io {
                 LOG_WARN("[PipelinedImageLoader] Run spill folder creation failed: {}", ec.message());
                 run_spill_folder_.clear();
             }
+        }
+
+        // LFS_JPEG2K_CACHE=0 keeps depth and normal sidecars and 16-bit images out of the JPEG 2000
+        // cache, so they are decoded from their sources each epoch, as when the codec is unavailable (#3604).
+        if (lfs::core::environment::value("LFS_JPEG2K_CACHE") == "0") {
+            jpeg2k_cache_available_.store(false, std::memory_order_relaxed);
+            LOG_INFO("[PipelinedImageLoader] JPEG 2000 cache disabled by LFS_JPEG2K_CACHE=0");
         }
 
         running_ = true;

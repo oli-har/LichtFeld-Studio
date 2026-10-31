@@ -35,8 +35,9 @@ Each cause below is marked:
 | #3948 | `ViewerGpuMemory`, `SessionBreadcrumb`, `TensorReserveInplaceCat`, `LpipsOps` | Fixed (LPIPS by naming the operation in its messages) |
 | #3948 | `HostMetrics` | Plan: Windows never samples CPU usage (product gap) |
 | #3948 | `NvCodecSentinelValidator`, `VideoFrameExtractorTrim`, `VideoExportUtils` | Plan: one experiment each decides the fix |
-| #3948 | Camera validation, CUDA–Vulkan parity, masked SSIM | See [GPU numerics](#gpu-numerics-and-camera-validation) |
-| #3948 | Gradients, stack overflow, VMA objects, crash at exit | See [Gradients and teardown](#gradients-stack-overflow-vma-objects-and-the-crash-at-exit) |
+| #3948 | Camera validation (5) | Fixed: a product bug in `Camera`'s move constructor, on every platform |
+| #3948 | CUDA–Vulkan parity (5), masked SSIM | Plan: see [GPU numerics](#gpu-numerics) |
+| #3948 | Fused normal gradients (3), `NormalLossHunt`, stack overflow, VMA objects, crash at exit | Plan: see [Gradients and teardown](#gradients-stack-overflow-vma-objects-and-the-crash-at-exit). The exit crash and the stack overflow are product bugs with one shared cause |
 
 ## Getting started on the Windows CUDA PC
 
@@ -230,6 +231,7 @@ and `utf8_to_path` doesn't need the explicit length.
 | `ViewerGpuMemory.CudaStatusKeepsDeviceUsageAndItsOptionalUtilizationReading` | **Confirmed.** On Windows `process_budget` is the DXGI local budget, by design (`GpuMemoryQuery.OversubscriptionIsExplicitAndDeviceUsageIsPhysical` expects it) | The `== 0` check is Linux-only |
 | `SessionBreadcrumbTest.SnapshotsOnlyTheUncleanPreviousLogTail` | **Likely.** The breadcrumb resolves its log through `UserPaths`, which honours `LFS_HOME`. `Logger::default_log_file_path()` ignores it, so with `LFS_HOME` set the two point at different files | `HomeDirectoryGuard` clears `LFS_HOME`. The product side is in [Still open](#still-open) |
 | `TensorReserveInplaceCatCuda.AllocationFailurePreservesInstalledStorage` | **Likely.** Under WDDM, the driver's sysmem fallback lets `cudaMalloc` go past dedicated memory into shared system memory, so "total memory + 4 bytes" succeeds | It asks for 256 TiB. To confirm, set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" for `lichtfeld_tests.exe`: the old test then passes |
+| `CameraModels/GutScreenShare.*/4` (4), `GsplatRasterizerQuantTest.DecodedFp32AndQ16AreBitwiseEqualAcrossBandsAndWarmup` | **Confirmed product bug, on every platform.** `Camera`'s move constructor and move assignment (`src/core/camera.cpp`) copied every member except `_camera_model_type` and `_has_alpha`. A moved thin-prism or fisheye camera became a pinhole camera that kept its 4 radial coefficients, and the PINHOLE validation (since #2683) throws "Pinhole cameras require at most three polynomial radial coefficients…". The tests pick their camera with `cond ? make_a() : make_b()`. GCC and Clang build that in place, while MSVC appears to move it (Likely), which is why only Windows saw it. `_has_alpha` was also missing from the transform copy, so a moved camera stopped using its alpha as a mask | Both members are copied, and the new `CameraMove.KeepsModelTypeAndAlpha` test (CPU only) covers it. Expect `GutScreenShare.*/2` (fisheye) and `/3` (equirectangular) to change on Windows: they ran as pinhole before and passed, and now really use their models |
 | `LpipsOpsTest.RejectsOperandDtypesBeforeLaunching` | **Likely.** The test looks for `convolution` in the host stack trace. On MSVC, internal-linkage functions only resolve with private PDB symbols, which a Release `lfs_training` doesn't have. The test's own frame has an external name, so it resolves | The operand checks now name their operation ("CUDA LPIPS convolution output must be…"), so the report says it without symbols. This also helps Release diagnostics |
 
 ## Still open
@@ -287,9 +289,193 @@ and `utf8_to_path` doesn't need the explicit length.
     - `:416`: the marker position;
     - the bounded wait in `vulkan_wait.hpp` timing out.
 
-<!-- GPU-NUMERICS -->
+### GPU numerics
 
-<!-- GRADIENTS-TEARDOWN -->
+None of these run in CI, on Linux or Windows: hosted jobs run only CPU and media labels,
+and the opt-in self-hosted GPU job runs only node and spatial tests.
+
+**CUDA versus Vulkan parity** (Open):
+
+- `TrainingOpsFastParity.NonzeroImageGradientAndFusedAdamVulkan`,
+  `PixelErrorDensificationWithoutStrategyModeVulkan` and
+  `SeptemberRegularizersAndMeanStepsMatchCuda`
+- `TrainingOpsGeometryParity.LargeUnweightedImagesVulkan`
+- `Backends/TrainingOpsFamilyParity.MatchesCuda/Photometric_Vulkan`
+
+All are in `tests/test_training_ops_parity.cpp`.
+
+**Ruled out by reading:**
+
+- The inputs are deterministic integer patterns, not `std::` random distributions.
+- Both backends run in one process.
+- The nvcc flags are the same on both platforms.
+- The SPIR-V is built the same way on both.
+
+That leaves the NVIDIA driver's shader compiler, host dispatch compiled by MSVC, and the
+GPU architecture.
+
+**The quoted mismatch**, `1101.adam.2.parameter index 2 -0.081000 vs -0.079000`, comes
+from the Fast tests, not Photometric:
+
+- It is the first Adam step on splat 0's rotation (quaternion y = −0.08, lr = 1e-3).
+- A first step moves by exactly ±lr, so CUDA and Vulkan disagree on the sign of that
+  gradient.
+- Everything compared before it matched: the image, alpha, depth and normal, and the
+  means and scales.
+- FastGS normals reach the rotation gradient only through `grad_normal_helper`. That
+  points at the CUDA normal-channel failures in the next section, so start there.
+
+**Experiments, in order:**
+
+1. Fix the [fused normal-channel gradients](#gradients-stack-overflow-vma-objects-and-the-crash-at-exit)
+   first, then rerun the Fast parity tests.
+2. Run each failing test alone. Record the first failing field, since the tests stop at
+   the first mismatch, and whether it passes in isolation (the suite has global
+   `set_*_for_testing` hooks).
+3. Compare against Linux with the built-in dumps:
+   - `LFS_TRAINING_OPS_GOLDEN=<dir>` with `--gtest_filter=TrainingOpsParity.WriteGoldens`.
+     If the CUDA goldens are byte-identical across the two OSes, only the Vulkan side
+     moved.
+   - `LFS_PARITY_DIAGNOSTICS=<dir>` with
+     `--gtest_filter=TrainingOpsFastParity.SeptemberRegularizersAndMeanStepsMatchCuda`.
+4. Vary the Vulkan side with `--tensor-no-atomic-float` (it changes the summation order),
+   or another driver version. Failures that follow the driver are codegen.
+
+**Likely fixes, once the first failing fields are known:**
+
+- **Geometry** compares fp64 per-block partial sums byte-exactly over 1.09M pixels. Across
+  two compilers, use the `kReduce` tolerance between backends and keep exact comparison
+  within one backend. Alternatively, mark the shader arithmetic that must match as
+  `precise`, as the expression JIT already does (NoContraction).
+- **Photometric** stores SSIM partials as fp16, which amplifies 1-ULP driver differences.
+  Same choice as for Geometry.
+- **Fast:** compare raw gradients (`prepare_fastgs_gradient_capture`) or a second Adam
+  step, not the sign that a first step exposes.
+
+**`MaskedSSIMMetricTest.AllSupportedMapsMatchUnmaskedMaps`** (Vulkan run only, Likely):
+
+- **What differs:** 0.98671073 against 0.98671055, which is 3 ULP. The two arms run the
+  same `photometric_fused` shader with different specialization constants, so the driver
+  compiles two pipelines, and the shared unweighted arithmetic isn't `precise`.
+- **Experiment:** temporarily change the `ASSERT_EQ` at
+  `tests/test_masked_ssim_metrics.cpp:172` to `EXPECT_EQ`, and count the differing
+  elements.
+- **Fix:** a few scattered 1–4 ULP differences mean codegen: allow ≤ 4 ULP for Vulkan, or
+  make the shared path `precise`. Nearly every element differing would mean the masked
+  arm took the weighted path because `1.0f / max(1.0f, mask)` wasn't exactly 1. That
+  would be a product bug.
+
+### Gradients, stack overflow, VMA objects and the crash at exit
+
+**One mechanism behind the crash at exit and the stack overflow.** On Windows, the app,
+the tests and most dependencies are DLLs (Linux links them statically).
+
+- `std::_Exit`, used by `flush_and_exit`, ends in `ExitProcess`, which still runs every
+  DLL's static destructors, after killing the other threads.
+- By then, the delay-loaded `nvcuda.dll` and the Vulkan driver have already shut down.
+
+So the promise in `tests/test_main.cpp` ("do NOT return into C++ static/TLS destruction")
+doesn't hold on Windows. On Linux, `_Exit` skips all of that.
+
+**Fused normal-channel gradients** (Open; a product bug if confirmed, because it affects
+training with the normal loss):
+
+- **Tests:** `FastGSNormalChannelTest.BackwardNormalRotationGradientMatchesFiniteDifferences`
+  and `BackwardNormalRotationGradientUsesCompactVisibleIndex` (the gradient is 0 where
+  finite differences give −0.0429), and
+  `NormalLossRegression.OffCenterOverlappingFullFusedGradients` (3.162 against −0.0602).
+- **Ruled out:**
+  - random inputs (the scenes are hard-coded);
+  - `long` and `long double`;
+  - `_WIN32` and `_MSC_VER` branches;
+  - kernel argument layout;
+  - nvcc flags;
+  - cross-stream races (everything runs on one stream);
+  - different kernel variants.
+- **What is left:** `DeferredNormalRotationGradientMatchesFiniteDifferences` (same scene
+  and kernels) and the fused `FastGSDepthGradientTest.*` are not in the failing list. So
+  what fails is the fused Adam path combined with the normal channel. 3.162 = √10 is the
+  value the moment codec stores after one step from zero, which hints that the test read
+  moment storage rather than a gradient.
+- **Experiments:**
+  1. `--tensor-backend=cuda --gtest_filter=FastGSNormalChannelTest.*:FastGSDepthGradientTest.*:NormalLossRegression.OffCenterOverlappingFullFusedGradients`:
+     confirm that the deferred test passes and the fused ones fail.
+  2. Repeat with `CUDA_LAUNCH_BLOCKING=1`, then run
+     `compute-sanitizer --tool racecheck` and `--tool initcheck` on
+     `FastGSNormalChannelTest.BackwardNormalRotationGradientMatchesFiniteDifferences`.
+  3. Run `nsys profile -t cuda -o nrm lichtfeld_tests.exe --tensor-backend=cuda --gtest_filter=FastGSNormalChannelTest.BackwardNormalRotationGradientMatchesFiniteDifferences`
+     and `nsys stats -r cuda_gpu_kern_sum nrm.nsys-rep`. The `blend_backward_cu<…>` row
+     must have its normal-channel template argument set to `true`.
+  4. After the backward, print `opt.get_state(ParamType::Rotation)->joint_bounds.cpu()`
+     and the first 16 bytes of `exp_avg`. All-zero bounds mean the rotation row was never
+     updated; non-zero bounds point at per-cell encoding or decoding.
+  5. Run the same commit on Linux with an RTX 50-series card (sm_120, CUDA 12.8), to
+     separate Windows from the GPU and toolkit.
+
+**`NormalLossHunt.JointRotationCodec100kSteps`** (Likely test bug):
+
+- **Cause:** it asserts the codec's error is at most a pre-fix error measured on Linux,
+  with no margin (0.000488 for mode 1; Windows gave 0.00088). Mode 1 is the only one that
+  calls `std::sin`, and the codec uses `log`, `log1p`, `exp` and `expm1`. glibc and the
+  MSVC runtime can differ in the last bit, and 100k feedback steps compound that.
+- **Unaffected:** the test's real purpose, zero-variance cells decoding as exactly zero
+  (#2066), is checked exactly.
+- **Fix:** compute the pre-fix error in the same run, with the decoder from before #2066
+  (no zero-variance guard), and assert the new error doesn't exceed it. Or give mode 1 a
+  margin.
+- **Confirm:** compare the printed `HUNT codec mode=1 …` line with Linux. If `tiny_fp32`
+  differs, the FP32 reference itself differs (`sinf` or `pow`).
+
+**`MeshDataTest.ProcessExitsCleanlyAfterMesh2Splat`** (Vulkan run, Likely, product bug):
+
+- **Cause:**
+  - The death-test child builds the converter's output on the default tensor backend,
+    which creates the tensor library's Vulkan context, then calls `std::exit(0)`.
+  - The static `g_context_slot` (`vk_context.cpp`) is then destroyed after the Vulkan
+    driver has shut down. `~VulkanContext` and `shutdown()` call into the driver.
+  - mesh2splat leaks its own `VkDevice` for exactly this reason (`mesh2splat.cpp`, the
+    comment near the end), but the tensor library's context isn't leaked.
+- **Decide it in one step:** add `lfs::core::shutdown_gpu_backend(lfs::core::GpuBackend::Vulkan);`
+  before the test's `std::exit(0)`. If the child then exits 0, the cause is confirmed.
+  Or capture a dump with Windows Error Reporting LocalDumps for `lichtfeld_tests.exe` and
+  run `!analyze -v; kc 200` in WinDbg.
+- **Fix:** allocate the context slot and its mutex on the heap and never free them, as
+  `vulkan_queue_sync.cpp` already does, and make `~ThreadRecorderToken` do nothing once
+  teardown has started.
+- **Who else is affected:** any Windows process on the Vulkan tensor backend that exits
+  through `exit()` without the GPU teardown. For example, the Python module registers
+  `std::atexit(shutdown_python_tensor_backend)`, which runs only when the `.pyd` unloads,
+  after the driver.
+
+**`Backends/ExpressionTest.CpuScalarUsesInlineParameters/Vulkan`** (Open):
+
+- **How the count works:** it includes freed-but-pending buffers, and the recorder batches
+  up to 64 commands. This kernel passes its 5 words as push constants, so it shouldn't
+  allocate at all.
+- **Experiment:** run it alone with `--gtest_repeat=3`.
+  - +3 on the first repetition only means objects created on first use. That's a test
+    bug: launch once, `synchronize_device()` and trim before taking `before`, then
+    synchronize and trim before comparing.
+  - +3 every time means an allocation per launch, which is a product bug. Break on
+    `VulkanMemory::allocate_storage` and `ensure_staging` after the first count to see
+    who allocates.
+
+**`lichtfeld_tests` exits with 0xC0000005 after the report** (mechanism confirmed, product
+bug: the app exits the same way):
+
+- **Cause:** DLL static destructors run after the drivers shut down, as above. One
+  example: the static `RandomGenerator` owns a cuRAND generator, and `~CudaRandomState`
+  calls `curandDestroyGenerator` then. Killed worker threads stop at different places
+  each run, which fits a crash in 3 of 4 runs.
+- **Confirm first:** run `procdump -accepteula -ma -e -x C:\dumps lichtfeld_tests.exe --tensor-backend=cuda --gtest_brief=1`,
+  then `!analyze -v; kc` in WinDbg. Expect
+  `LdrShutdownProcess → <module>!dllmain_crt_process_detach → _execute_onexit_table → dynamic atexit destructor for '…'`.
+- **Fix:**
+  - On Windows, make `flush_and_exit` (`src/core/crash_handler.cpp`) flush stdio and the
+    logger, then call `TerminateProcess(GetCurrentProcess(), code)`. That has the effect
+    `_Exit` already has on Linux.
+  - Release the random generator's CUDA state in `teardown_gpu_before_exit`.
+- **Verify:** 10 full runs per backend with exit code 0.
 
 ## Keep Windows from regressing
 
