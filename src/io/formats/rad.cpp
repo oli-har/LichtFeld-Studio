@@ -3255,6 +3255,7 @@ namespace lfs::io {
             std::uint64_t chunk_table_offset = 0;
             std::uint8_t lod_opacity_encoded = 0;
             std::uint8_t complete = 0;
+            std::uint8_t reserved[6]{}; // The header is written byte for byte, so its padding must be zeros.
         };
         static_assert(sizeof(RadMetaHeader) == 96);
         static_assert(sizeof(RadMetaHeader) <= RAD_META_HEADER_BYTES);
