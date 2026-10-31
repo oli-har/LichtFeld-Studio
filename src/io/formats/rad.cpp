@@ -5687,9 +5687,12 @@ namespace lfs::io {
                 }
             });
 
+        // Close rather than flush: Windows cannot rename or remove the temp file
+        // below while a worker's handle to it is still open.
         for (auto& scratch : scratch_tls) {
             if (scratch.open_ok) {
-                scratch.out.flush();
+                scratch.out.close();
+                scratch.rad.close();
             }
         }
         if (cancelled.load()) {
