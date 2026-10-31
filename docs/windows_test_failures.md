@@ -1,15 +1,93 @@
 # Windows test failures: fixes and plan
 
-Status of the Windows test reports filed against dev `ab623c39d`:
+This covers the Windows `lichtfeld_tests` reports filed against dev `ab623c39d`:
 
 - [#3944](https://github.com/MrNeRF/LichtFeld-Studio/issues/3944): three test programs don't build
 - [#3945](https://github.com/MrNeRF/LichtFeld-Studio/issues/3945): node tests keep a `Node&` across `add_node`
 - [#3946](https://github.com/MrNeRF/LichtFeld-Studio/issues/3946): `PinnedBlockReusedOnlyAfterAllStreamsDone` hangs
+- [#3947](https://github.com/MrNeRF/LichtFeld-Studio/issues/3947): CUDA connected components read past the union-find array
 - [#3948](https://github.com/MrNeRF/LichtFeld-Studio/issues/3948): the other failing tests, grouped by cause
 
-The changes on this branch were made on Linux without CUDA, MSVC or a GPU. None of
-them has been compiled or run on Windows yet. Each section says what still needs
-to be checked there.
+Other open upstream bugs are planned in [open_bug_plan.md](open_bug_plan.md).
+
+The branch `claude/vibrant-lovelace-747k7o` is upstream `dev` (`809251714`) plus these fixes.
+Everything was worked out by reading the code on Linux, without MSVC, CUDA or a GPU, so
+**nothing here has been compiled or run on Windows yet**. The only exception is the
+`UsdHalfTest` reference converter, which was checked numerically on Linux.
+
+Each cause below is marked:
+
+- **Confirmed**: the code clearly does this.
+- **Likely**: it fits the evidence but depends on Windows behaviour that couldn't be observed here.
+- **Open**: needs a run on the Windows machine.
+
+## Status
+
+| Issue | Tests | State |
+| --- | --- | --- |
+| #3944 | 3 programs | Fixed: exports, a `far` macro clash and link libraries |
+| #3945 | 5 node tests, plus 1 more found | Fixed in the tests |
+| #3946 | 1 | Fixed in the test |
+| #3947 | 8 node and tensor tests on CUDA | Fixed in the CUDA launch; one ordering question left to check |
+| #3948 | Open files, atomic writes (13) | Fixed: 11 tests, plus 2 product fixes (atomic commit retry, RAD sidecar) |
+| #3948 | Paths, Unicode, case (9) | Fixed in the tests |
+| #3948 | `UsdHalfTest`, `LFS_HOME`, scene source path, camera node | Fixed (scene source path is a product fix) |
+| #3948 | `ViewerGpuMemory`, `SessionBreadcrumb`, `TensorReserveInplaceCat`, `LpipsOps` | Fixed (LPIPS by naming the operation in its messages) |
+| #3948 | `HostMetrics` | Plan: Windows never samples CPU usage (product gap) |
+| #3948 | `NvCodecSentinelValidator`, `VideoFrameExtractorTrim`, `VideoExportUtils` | Plan: one experiment each decides the fix |
+| #3948 | Camera validation, CUDA–Vulkan parity, masked SSIM | See [GPU numerics](#gpu-numerics-and-camera-validation) |
+| #3948 | Gradients, stack overflow, VMA objects, crash at exit | See [Gradients and teardown](#gradients-stack-overflow-vma-objects-and-the-crash-at-exit) |
+
+## Getting started on the Windows CUDA PC
+
+Use the **x64 Native Tools Command Prompt for VS 2022**: the libplacebo port needs
+`clang-cl` from it (see #3205 in [open_bug_plan.md](open_bug_plan.md)).
+
+```bat
+git fetch origin claude/vibrant-lovelace-747k7o
+git switch claude/vibrant-lovelace-747k7o
+cmake --preset windows-release -DBUILD_TESTS=ON
+cmake --build --preset windows-release --target lichtfeld_tests vksplat_custom_effect_tests shader_service_tests
+```
+
+The build folder is `build-windows-release`. `/FORCE:UNRESOLVED` is no longer needed. If
+a link still fails, that is #3944 not fully fixed: note the unresolved symbols.
+
+Set `LFS_HOME` to a scratch folder as before, so the tests don't write into your real
+user folder. The tests that depend on it now clear it themselves. `LFS_LOG_LEVEL=debug`
+adds detail when a test needs it.
+
+Then, in this order:
+
+1. **Check the fixes.** Run each filter in [Checking the fixes](#checking-the-fixes). They
+   are small and fast, and a failure points at one change.
+2. **Run everything**, once per backend, and compare with the lists in #3948:
+   ```bat
+   lichtfeld_tests --tensor-backend=cuda --gtest_brief=1 --gtest_output=xml:cuda.xml
+   lichtfeld_tests --tensor-backend=vulkan --gtest_brief=1 --gtest_output=xml:vulkan.xml
+   ```
+3. **Work through the open items** in [Still open](#still-open). Each has the experiment
+   that decides it.
+
+Tools that help:
+
+- `compute-sanitizer`, from the CUDA toolkit, for #3947.
+- Sysinternals `handle64` and Process Monitor (filter on Result = `SHARING VIOLATION`) for
+  "file in use" errors.
+- `procdump -e -x . lichtfeld_tests.exe ...` for crashes.
+
+### Checking the fixes
+
+| Fix | Command (add `--tensor-backend=cuda` unless noted) |
+| --- | --- |
+| #3944 | Build the three targets above |
+| #3945 | `--gtest_filter=Backends/NodesCore.*`, with each backend |
+| #3946 | `--gtest_filter=TensorMultiStreamTest.*` |
+| #3947 | `--gtest_filter=Backends/NodesCore.*/CUDA:Backends/RestoredTensor.ConnectedComponentsOverload/Cuda`, then the same under `compute-sanitizer --tool memcheck` and `--tool initcheck` |
+| Open files | `--gtest_filter=MetricsReporter.*:ViewEvaluationJson.*:MetricsEvaluatorControlTest.*:NormalAutoGenerateIntegration.*:PriorAutoGenerateIntegration.*:SsogFormat.*:PlyToRadLod.*:RadMetaSidecar.*:RadSparkPagingTest.*:RadLodLeaves.*` |
+| Atomic writes | `--gtest_filter=UserPathsContractTest.* --gtest_repeat=200` |
+| Paths and Unicode | `--gtest_filter=UnicodePathTest.*:CrashHandlerTest.*:PlyErrorTaxonomyTest.*:MissingDatasetImagesTest.*:VideoExtractorNamingUiTest.*` |
+| Smaller fixes | `--gtest_filter=UsdHalfTest.*:SceneGraphIdentityTest.*:ViewerGpuMemory.*:GpuMemoryQuery.*:SessionBreadcrumbTest.*:TensorReserveInplaceCat*.*:LpipsOpsTest.*` |
 
 ## Fixed on this branch
 
@@ -18,190 +96,209 @@ to be checked there.
 | Program | Cause | Change |
 | --- | --- | --- |
 | `lichtfeld_tests` | `gui::isBoundsGizmoActive()` is not exported from the `lfs_visualizer` DLL | `LFS_VIS_API` on its declaration (`src/visualizer/gui/bounds_gizmo.hpp`) |
-| `vksplat_custom_effect_tests` | `<windows.h>` defines `far` as an empty macro | Renamed the local to `far_offset` (`tests/test_vksplat_custom_effect.cpp`) |
-| `shader_service_tests` | `lfs_visualizer` links the static `lfs_io` and `lfs_sequencer` privately, so their symbols don't reach the test through the DLL; `readOutputImageRgba` was the one `readOutputImage*` member without `LFS_VIS_API` | Linked `lfs_io` and `lfs_sequencer` into the test, as `lichtfeld_visualizer_tests` already does, and exported `readOutputImageRgba` (`tests/CMakeLists.txt`, `src/visualizer/rendering/vksplat_viewport_renderer.hpp`) |
-
-To check on Windows: `cmake --preset windows-release -DBUILD_TESTS=ON`, then build
-all three targets without `/FORCE:UNRESOLVED`. If `shader_service_tests` still
-has unresolved symbols, they come from the remaining private dependencies of
-`lfs_visualizer`. List them with `dumpbin /exports lfs_visualizer.dll`.
+| `vksplat_custom_effect_tests` | `<windows.h>` defines `far` as an empty macro | The local is renamed `far_offset` (`tests/test_vksplat_custom_effect.cpp`) |
+| `shader_service_tests` | `lfs_visualizer` links the static `lfs_io` and `lfs_sequencer` privately, so their symbols don't reach the test through the DLL. `readOutputImageRgba` was the one `readOutputImage*` member without `LFS_VIS_API` | The test links `lfs_io` and `lfs_sequencer` itself, as `lichtfeld_visualizer_tests` does (`LFS_IO_API` is empty on Windows, so that's safe), and `readOutputImageRgba` is exported |
 
 ### #3945: node references kept across `add_node`
 
-`NodeTree::nodes` is a `std::vector<Node>`, and `add_node` returns `nodes.back()`.
-MSVC grows a vector by half, so the fourth node (the second one a test adds) moves
-the third. The five tests in the issue now keep a name, and look the node up with
-`find_node` after the last `add_node`. The file already did this further down
-("Node references do not survive later add_node calls; keep names").
+**Confirmed.** `NodeTree::nodes` is a `std::vector<Node>`, and `add_node` returns
+`nodes.back()`. MSVC grows a vector by half, so a test's second node moves its first.
+The five tests now keep names and look nodes up with `find_node` after the last
+`add_node`, as the same file already did elsewhere.
 
-A scan of every `tests/*.cpp` for a `Node&` used after a later `add_node` found one
-more: `NodesCore.CameraNodesMatchSyntheticRingAndCapturedDistance`. It ignored
-the result of `add_link`, so on Windows the camera node was never linked and
-`missing.ok` came back true. This is the "Other" entry in #3948. It is fixed the
-same way, and its `add_link` calls are now `ASSERT_TRUE`.
+A scan of every test found a sixth case,
+`NodesCore.CameraNodesMatchSyntheticRingAndCapturedDistance`. It ignored the result of
+`add_link`, so on Windows the camera node was never linked and `missing.ok` came back
+true (listed in #3948). Its `add_link` calls are now `ASSERT_TRUE`.
 
-`add_node` in `src/core/include/core/nodes/tree.hpp` now has a comment saying the
-reference is invalidated by later calls. The production callers don't keep one,
-so the container type is unchanged. Making `nodes` a `std::deque`, or storing
-`std::unique_ptr<Node>`, would remove the trap. But `nodes` is a public member
-used in about 40 places, including the Python bindings, so that is a separate change.
+`add_node` in `tree.hpp` now has a comment about the invalidation. Changing `nodes` to a
+container with stable references (a `std::deque`, or `std::unique_ptr<Node>` elements)
+would remove the trap. But `nodes` is a public member used directly in dozens of places,
+including the Python bindings, so that's a separate change.
 
-To check on Windows: `lichtfeld_tests --gtest_filter=Backends/NodesCore.*` with
-each `--tensor-backend`.
+### #3946: the pinned-memory test hang
 
-### #3946: pinned-memory test deadlock
+**Likely.** The test closed a gate (a `cudaLaunchHostFunc` that spins), then blocked in
+`cudaStreamSynchronize` on an independent stream. On Windows that copy never completed
+behind the spinning host function. Two changes:
 
-Before, the test closed the gate (a `cudaLaunchHostFunc` that spins), enqueued
-the gated H2D copy and an independent D2H copy, and then blocked in
-`cudaStreamSynchronize(d2h_stream)`. On Windows the D2H copy never completed
-while the host function spun.
+- **No blocking while the gate is closed.** The D2H use of the block now finishes before
+  the gate closes. While it is closed, the test waits for `d2h_stream` with a 10-second
+  `cudaStreamQuery` loop, so a stall fails the test instead of hanging it (the destructor
+  releases the gate).
+- **No CUDA allocation while the gate is closed.** A spare block is cached first, so the
+  allocation made while the gate is closed is a cache hit. A miss would call
+  `cudaHostAlloc`, and CUDA's implicit-synchronization rules cover page-locked
+  allocations.
 
-Now the D2H use of the block finishes before the gate closes. After
-`deallocate(host_block, d2h_stream)`, the test waits for `d2h_stream` with a
-10-second `cudaStreamQuery` loop instead of a blocking synchronize. The
-assertions are unchanged: a block is not reused while the gated H2D copy is
-pending, and is reused once every stream is done. If Windows still serializes
-even the event that `deallocate` records, the test now fails with
-"d2h_stream did not finish while the gate was closed" instead of hanging, because
-`~GateStream` releases the gate.
+The assertions are unchanged.
 
-To check on Windows: `lichtfeld_tests --gtest_filter=TensorMultiStreamTest.*`.
+### #3947: CUDA connected components read past the union-find array
 
-### #3948: fixed so far
+**What the code shows (confirmed):**
 
-| Test(s) | Cause | Change |
+- The union kernels (`union_components`, `point_tree_union`) only ever point a root at a
+  smaller index, and path halving only writes ancestors.
+- `next[i]` is written for every point that enters a hash chain, and only those are
+  followed.
+- So no kernel can write a parent outside the array. An out-of-range parent can only come
+  from `parent`, which is the `labels` tensor, holding something other than its
+  initialization `[0, 1, …, n−1]` when the kernels read it.
+- That matches initcheck ("reads entries of the `parent` array that were never written").
+- It also matches the one address in the issue: subtracting 4 × `0x3F800000` (the bits of
+  `1.0f`) from it gives a cleanly aligned base. That fits stale float data, or the
+  `cumsum − 1` result before its cast to Int32.
+
+**The change:** `launch_radius_connected_components` and `launch_point_tree_components`
+now write `parent[i] = i` themselves, with a new `init_components` kernel. It runs on the
+stream the union and flatten kernels use, right before them
+(`src/core/tensor/backend/cuda/kernels/tensor_spatial.cu`). Both callers in
+`tensor_spatial.cpp` pass exactly that identity, so nothing else changes. CPU, Vulkan and
+HIP are untouched.
+
+**Open:** why `labels` wasn't initialized on that stream. `tensor_spatial.cpp` builds it
+as `(allocate_like(..., Int32, 1.0f).cumsum(0) - 1).to(Int32)`. That is a deferred
+expression, materialized by `pin_operands`, and the kernels run on `labels.stream()`. If
+the materializer runs on a different stream from the one `labels.stream()` reports, or
+the lazy-executor materialization cache hands back a result produced elsewhere, other
+code using this pattern is exposed too. To check:
+
+1. Run the #3947 filter above with `CUDA_LAUNCH_BLOCKING=1` on the commit before this
+   branch's fix (`f1ad7d687`). If the failures disappear, it is an ordering race.
+2. On this branch, the filter should pass and compute-sanitizer should report nothing. If
+   labels are still wrong, look for a late write to `labels` from another stream: log
+   `labels.stream()` and `getCurrentCUDAStream()` in `radius_connected_components`, and
+   compare with the stream `materialize_deferred_slow` binds.
+3. Add a small test next to `tests/test_tensor_stream.cpp`'s late-initialization test:
+   build `(Tensor::full({n}, 1, GPU, Int32).cumsum(0) - 1).to(Int32)` on one stream, read
+   it from a kernel on `labels.stream()`, and check that it equals `[0, n)`.
+
+The reporter didn't try CUDA on Linux, so this may not be Windows-specific.
+
+### #3948: files still open
+
+**Confirmed for all of these.** Windows can't delete a file, or rename over it, while a
+handle to it is open without `FILE_SHARE_DELETE`, and MSVC streams and memory maps don't
+share delete.
+
+| Test | Held file | Change |
 | --- | --- | --- |
-| `UsdHalfTest.RoundTripAndRoundingMatchIEEE754` | The test's reference converter was wrong, not `float_to_half`. MSVC has no `_Float16`, so the fallback is used there. It ORed a mantissa that includes the implicit bit into the exponent field, so 2^-14 came out as `0x0800` | The fallback adds the rounded mantissa to `(exponent - 113) << 10`. On Linux it matches hardware `_Float16` on every 7th float bit pattern (611 million non-NaN values) |
-| `RadMetaSidecar.*` (2), `RadSparkPagingTest.StreamedExportOpensInThePagedViewer`, `RadLodLeaves.OutOfCoreModelRefusesToFlatten` | **Library bug.** `build_rad_meta_sidecar` gives each TBB worker its own `std::fstream` on the temporary sidecar. The streams were only flushed, and stayed open until the function returned, after the `rename`. Windows refuses to rename a file that has an open handle, so this also affects users | Workers' streams are closed before the rename (`src/io/formats/rad.cpp`) |
-| `SceneGraphIdentityTest.SceneInfoSourcePathIsMostRecentlyAddedNode` | **Library bug.** `getSceneInfo()` reported `splat_paths_.begin()`, and `splat_paths_` is a `std::unordered_map`, so the "source path" depended on hash order. It is wrong on every platform, but only showed up on MSVC | Picks the path whose node has the highest id. Node ids only grow, and an undone delete gets its old id back (`src/visualizer/scene/scene_manager.cpp`) |
-| `UserPathsContractTest.PortableRootUsesExecutableDirectory`, `PortableRootRequiresExecutableDirectory` | `LFS_HOME` takes precedence over the portable root, and was set for the run | Both tests clear `LFS_HOME`, as other tests in the file already do |
-| `Backends/NodesCore.CameraNodesMatchSyntheticRingAndCapturedDistance` | Same as #3945 | See above |
+| `MetricsReporter.VulkanRunRecordsCpuJpegDecoding` | the report the test reads (`ifstream report`) | Close it before `remove_all` |
+| `ViewEvaluationJson.OneFileKeyedByImageNameInTheOutputFolder` | `per_image_metrics.json` (`in`) | Same |
+| `MetricsEvaluatorControlTest.StopDuringPausedFinalEvaluationCancelsWithoutPartialMetrics` | `metrics.csv` (`csv`) | Same |
+| `NormalAutoGenerateIntegration.OverwritesExistingMapWhenCameraHasNone` | `stale.png` (`in`) | Same |
+| `PriorAutoGenerateIntegration.OneJobPerImageCarriesOnlyMissingMaps` | `normals/a.png` (`kept`) | Same |
+| `SsogFormat.BundleCancellationPreservesDestination` | `scene.ssog` (`file`), removed mid-test | Same |
+| `PlyToRadLod.OutOfCoreLoadKeepsTreeAndStreamsChunks` | `synthetic.rad.meta`, memory-mapped by the out-of-core model `partial` (`MappedFile` opens with `FILE_SHARE_READ` only) | The models live in a block that ends before `remove_all` |
+| `RadMetaSidecar.RoundtripQuantizationAndInvalidation` | `sidecar.rad.meta`, mapped by `view` while the test rebuilds the sidecar over it | `view` lives in a block that ends before the rebuild |
+| `RadMetaSidecar.ConverterEmitsSidecarInline`, `RadSparkPagingTest.StreamedExportOpensInThePagedViewer`, `RadLodLeaves.OutOfCoreModelRefusesToFlatten` | The temp sidecar, held by the builder's own workers | **Product fix:** `build_rad_meta_sidecar` closes each TBB worker's stream on the temp file before the rename. They were only flushed (`src/io/formats/rad.cpp`) |
+| `UserPathsContractTest.ConcurrentAtomicWritesDoNotShareTemporaryFiles` | `preferences.json`, the destination of eight concurrent commits | **Product fix:** the Windows commit in `src/core/atomic_file.cpp` called `MoveFileExW` once. It now retries access denied, sharing and lock violations 20 × 50 ms, like `native_fs::rename`. This affects users: preferences, UI state, projects and image outputs all go through it |
 
-## Plan for the rest of #3948
+The three RAD tests in the second-to-last row weren't traced individually. If one still
+fails, the exception names the file, and `handle64 -p lichtfeld_tests.exe` shows the
+holder.
 
-Unless a cause is stated as found, it is a hypothesis from reading the code and
-needs a Windows run to confirm. Order of work: the user-facing items first
-(open handles, atomic writes, Unicode), then the test-only ones.
+### #3948: paths, Unicode and case
 
-### 1. Files still open when a temp folder is removed
+All of these are **confirmed** test bugs. The product code goes through `native_fs` and
+the UTF-8 path helpers correctly.
 
-`MetricsEvaluatorControlTest.StopDuringPausedFinalEvaluationCancelsWithoutPartialMetrics`,
-`MetricsReporter.VulkanRunRecordsCpuJpegDecoding`,
-`NormalAutoGenerateIntegration.OverwritesExistingMapWhenCameraHasNone`,
-`PlyToRadLod.OutOfCoreLoadKeepsTreeAndStreamsChunks`,
-`PriorAutoGenerateIntegration.OneJobPerImageCarriesOnlyMissingMaps`,
-`ViewEvaluationJson.OneFileKeyedByImageNameInTheOutputFolder`,
-`SsogFormat.BundleCancellationPreservesDestination`.
+| Test | Cause | Change |
+| --- | --- | --- |
+| `SsogFormat.BundleReadersAcceptSuffixCaseWithoutChangingRows` | It copies to `copy.sog`, then `copy.SOG`, which is the same file on NTFS | Each copy gets its own name |
+| `MissingDatasetImagesTest.TransformsImagePathResolvesUppercasePngWithoutExtension` | On NTFS the `.png` probe already finds `frame-one.PNG` and returns the probe's spelling | On a case-insensitive volume, compare with `fs::equivalent` |
+| `UnicodePathTest.CheckpointPathConstructionWithBufferPadding` | `path::string()` converts through the ANSI code page and throws | Compare `native()` sizes |
+| `UnicodePathTest.Utf8ToPathHandlesUnicodeWithEmbeddedNulls` | `test_root_ / "日本語_output"` decodes the narrow literal with the ANSI code page | `utf8_to_path("日本語_output")`. The helper's stop at the first NUL is intended, and other tests rely on it |
+| `CrashHandlerTest.InstallationReportsUnicodeCrashLogPathAsUtf8` | Windows death tests re-run the test body in a child, which inherits `LFS_HOME=root`. `test_main` opens its log file under `root`, so `remove_all(root)` fails and `ASSERT_FALSE(ec)` exits the child with 1 | The cleanup is best effort |
+| `PlyErrorTaxonomyTest.ExportSupportsLongLegalFileName` | The path passes MAX_PATH. The exporter handles that through `native_fs`, but the test checked with plain `std::filesystem`, and `lichtfeld_tests` has no `longPathAware` manifest | The test and its `TearDown` use `native_fs` |
+| `VideoExtractorNamingUiTest.BatchRowsDisambiguateDuplicateNamesAndExposePaths` | The output folder is joined with `operator/`, so the tooltip shows `batch_output\clip` | Expect the native separator |
 
-The same family as the rad sidecar: something still holds a handle (a stream, a
-`FILE*`, a memory map, a log sink, an image decoder) when the test's
-`TearDown` calls `remove_all`. Plan:
+Don't make these pass by giving `lichtfeld_tests` the app's manifest
+(`activeCodePage=UTF-8`, `longPathAware`). That would hide the code-page and MAX_PATH
+bugs that `native_fs` exists to prevent.
 
-1. Rerun one of them alone and use Sysinternals `handle.exe <temp dir>`, or
-   Process Explorer, at the failing `remove_all` to see which file is held open.
-2. `PlyToRadLod.OutOfCoreLoad...` probably holds the out-of-core RAD mapping
-   until the model is destroyed. Check that the test destroys the loaded model
-   before removing the folder, and that the mapping is released on destruction.
-3. For the metrics and view-evaluation tests, look for output streams owned by
-   objects that outlive the job (reporters, writers kept in a `shared_ptr`).
-4. Prefer fixing the owner (close on completion or cancel) over retrying the
-   delete in the test. Only add a retry in `TearDown` if the handle is held
-   by a third-party library, such as an antivirus or indexer scan.
+My earlier guesses for this group were wrong. Checkpoint paths don't call `string()`,
+and `utf8_to_path` doesn't need the explicit length.
 
-### 2. Atomic writes
+### #3948: smaller fixes
 
-`UserPathsContractTest.ConcurrentAtomicWritesDoNotShareTemporaryFiles` fails
-with "Atomic file commit failed ... Access is denied"
-(`src/core/atomic_file.cpp`, the `_WIN32` commit). Concurrent
-`MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)` onto the same target returns
-`ERROR_ACCESS_DENIED` while another thread has the target open, or is itself
-replacing it. Plan: on `ERROR_ACCESS_DENIED` and `ERROR_SHARING_VIOLATION`,
-retry the commit with a short backoff (about 10 × 10 ms) before failing. This
-is the usual Windows pattern. Also check that the temp files are opened with
-`FILE_SHARE_DELETE`. This affects users: concurrent preference writes.
+| Test | Cause | Change |
+| --- | --- | --- |
+| `UsdHalfTest.RoundTripAndRoundingMatchIEEE754` | **Confirmed.** The test's own reference converter was wrong, not `float_to_half`. MSVC has no `_Float16`, so it uses the fallback, which ORed a mantissa that still has its implicit bit into the exponent | The fallback adds it. It matches hardware `_Float16` on 611 million values on Linux |
+| `SceneGraphIdentityTest.SceneInfoSourcePathIsMostRecentlyAddedNode` | **Confirmed product bug.** `getSceneInfo()` reported `splat_paths_.begin()` of an `unordered_map`, so the result depended on hash order on every platform | Picks the path of the node with the highest id (`scene_manager.cpp`) |
+| `UserPathsContractTest.PortableRoot*` (2) | `LFS_HOME` takes precedence over the portable root | Both tests clear `LFS_HOME` |
+| `ViewerGpuMemory.CudaStatusKeepsDeviceUsageAndItsOptionalUtilizationReading` | **Confirmed.** On Windows `process_budget` is the DXGI local budget, by design (`GpuMemoryQuery.OversubscriptionIsExplicitAndDeviceUsageIsPhysical` expects it) | The `== 0` check is Linux-only |
+| `SessionBreadcrumbTest.SnapshotsOnlyTheUncleanPreviousLogTail` | **Likely.** The breadcrumb resolves its log through `UserPaths`, which honours `LFS_HOME`. `Logger::default_log_file_path()` ignores it, so with `LFS_HOME` set the two point at different files | `HomeDirectoryGuard` clears `LFS_HOME`. The product side is in [Still open](#still-open) |
+| `TensorReserveInplaceCatCuda.AllocationFailurePreservesInstalledStorage` | **Likely.** Under WDDM, the driver's sysmem fallback lets `cudaMalloc` go past dedicated memory into shared system memory, so "total memory + 4 bytes" succeeds | It asks for 256 TiB. To confirm, set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" for `lichtfeld_tests.exe`: the old test then passes |
+| `LpipsOpsTest.RejectsOperandDtypesBeforeLaunching` | **Likely.** The test looks for `convolution` in the host stack trace. On MSVC, internal-linkage functions only resolve with private PDB symbols, which a Release `lfs_training` doesn't have. The test's own frame has an external name, so it resolves | The operand checks now name their operation ("CUDA LPIPS convolution output must be…"), so the report says it without symbols. This also helps Release diagnostics |
 
-### 3. File names that differ only in case
+## Still open
 
-- `SsogFormat.BundleReadersAcceptSuffixCaseWithoutChangingRows` copies
-  `lower.sog` to `copy.SOG` in the same folder, which already exists on a
-  case-insensitive file system. Copy to a name that differs in more than case
-  (`copy_upper.SOG`).
-- `MissingDatasetImagesTest.TransformsImagePathResolvesUppercasePngWithoutExtension`
-  expects the on-disk spelling `frame-one.PNG`. On Windows the resolver gets
-  the spelling it probed with. Either compare with
-  `std::filesystem::equivalent`, or expect the case only when the file system
-  is case-sensitive (probe once in the fixture).
+### Product gaps found along the way
 
-### 4. Unicode, long names and paths
+- **`HostMetrics.CpuAndPerCoreBecomeValidAfterSecondSample`.** **Confirmed.** CPU sampling
+  in `src/core/host_metrics.cpp` exists only for POSIX (it reads `/proc`). The Windows
+  branch only sizes `per_core_cpu_percent` to −1, so the HUD always shows "--" for CPU on
+  Windows. Implement `read_cpu` with:
+  - `GetProcessTimes` for the process;
+  - `GetSystemTimes` for the system (its kernel time includes idle);
+  - `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` for each core.
 
-- `UnicodePathTest.CheckpointPathConstructionWithBufferPadding` ("No mapping for
-  the Unicode character exists in the target multi-byte code page"): something
-  calls `path::string()` (ANSI code page) instead of `lfs::core::path_to_utf8`.
-  Find the call in the checkpoint path construction. This affects users with
-  non-ASCII project folders.
-- `UnicodePathTest.Utf8ToPathHandlesUnicodeWithEmbeddedNulls`: the converter
-  probably stops at the first `\0` (it uses `MultiByteToWideChar` with `-1`, or
-  a `c_str()`). Pass the explicit length.
-- `CrashHandlerTest.InstallationReportsUnicodeCrashLogPathAsUtf8`: the death
-  test exits with status 1. Run the child alone to see which assertion fails,
-  probably the same narrow-string conversion.
-- `PlyErrorTaxonomyTest.ExportSupportsLongLegalFileName`: the full path is longer
-  than `MAX_PATH`. Either the exporter opens it without the `\\?\` prefix, or
-  the test binary has no `longPathAware` manifest. Check which. The app's
-  manifest matters too, if users can hit this.
-- `VideoExtractorNamingUiTest.BatchRowsDisambiguateDuplicateNamesAndExposePaths`:
-  the tooltip contains `batch_output\clip`. Compare with `generic_string()`, or
-  build the expectation with `std::filesystem::path`.
+  All three count in 100 ns units, so `ticks_per_second` = 1e7 on Windows. Then reuse the
+  POSIX delta code. Over the test's 10 ms a delta of 0 is legitimate and gives 0 %, which
+  the test accepts. Verify with `--gtest_filter=HostMetrics.*`.
+- **The log path ignores `LFS_HOME`, portable and explicit roots.** "Open Log"
+  (`error_event_bridge.cpp`) and Python `lfs.log.log_file_path()` call
+  `Logger::default_log_file_path()`. That always returns `~/.lichtfeld/logs/lichtfeld.log`,
+  while the app logs wherever `UserPaths` says. Better than copying the `UserPaths` rules
+  into the logger: have the logger remember the file it opened, and return that once it
+  is initialized.
 
-### 5. Camera validation (likely not Windows-specific)
+### Need one experiment each
 
-`CameraModels/GutScreenShare.*/4` (4 tests) and
-`GsplatRasterizerQuantTest.DecodedFp32AndQ16AreBitwiseEqualAcrossBandsAndWarmup`
-throw "Pinhole cameras require at most three polynomial radial coefficients or
-six rational radial coefficients" (`gsplat_rasterizer_cuda.cpp`). Variant 4 is
-`THIN_PRISM_FISHEYE`, with four radial coefficients, so a thin-prism camera reaches the
-`PINHOLE` branch. Check whether `Camera` or the rasterizer maps the model
-type before that `switch`, and whether CI on Linux runs these GPU tests at all.
-If Linux CI fails too, this is a real regression, not a Windows issue.
+- **`NvCodecSentinelValidatorTest.SkippedMemberIsRetriedOrFailsHardBeforeReturn`** (Likely).
+  - **Suspected cause:** the test compares two different JPEG decoders bit for bit. When
+    `nvjpegCreateEx(NVJPEG_BACKEND_HARDWARE)` succeeds, the first member goes to the
+    hardware JPEG engine (registered at VERY_HIGH priority). The retried member goes
+    through the CUDA decoder (`nvcodec_image_loader.cpp`, the HYBRID_CPU_GPU retry
+    decoder).
+  - **Experiment:** print the mismatch count and the largest difference. A few levels of
+    rounding confirms this; a leftover sentinel differs everywhere.
+  - **Fix if confirmed:** compare with a PSNR threshold (> 40 dB) instead of `EXPECT_EQ`.
+- **`VideoFrameExtractorTrim.SparseFpsStopsAtTheLastDecodableFrameInAStreamCopy`** (Likely).
+  - **Suspected cause:** "sequential" means `chooseFrameSelection` decided before any
+    seek. FFmpeg is pinned to the same version on both platforms, so the input that can
+    differ is `using_hw_decode`: NVDEC probably didn't take the 64×48 fixture.
+  - **Experiment:** run it alone and read the "Frame selection: sequential (reason=…)"
+    line, any `h264_cuvid` errors, and `processing.decoder.backend` in
+    `extraction_metadata.json`.
+  - **Fix:** if it's the software fallback, expect "sequential" when the backend isn't
+    NVDEC, or regenerate the fixture at 128×128 with the same timestamps.
+- **`VideoExportUtilsTest.EquirectangularMarkerPixelsFollowViewportCamera`** (flaky, Open).
+  - **What was ruled out:** the readback waits on the render timeline and invalidates
+    before copying, and no unsynchronized readback was found.
+  - **Experiments:**
+    - `--gtest_repeat=200 --gtest_break_on_failure` alone, per backend;
+    - then `--gtest_filter=VideoExportUtilsTest.* --gtest_repeat=50` and a full run with
+      `--gtest_shuffle`, to find an order dependence.
 
-### 6. Numbers that differ
+    The failing assertion line decides where to look. Possibilities:
+    - `:320`: the Vulkan backend shutdown, while earlier tests still hold Vulkan tensors;
+    - `:416`: the marker position;
+    - the bounded wait in `vulkan_wait.hpp` timing out.
 
-- CUDA vs Vulkan parity (`TrainingOpsFastParity.*Vulkan`,
-  `TrainingOpsGeometryParity.LargeUnweightedImagesVulkan`,
-  `TrainingOpsFamilyParity.MatchesCuda/Photometric_Vulkan`), and gradients
-  against finite differences (`FastGSNormalChannelTest.*`,
-  `NormalLossRegression.OffCenterOverlappingFullFusedGradients`,
-  `NormalLossHunt.JointRotationCodec100kSteps`): first run them on Linux with the
-  same commit and an RTX 50-series GPU. If they pass there, compare MSVC
-  host-side code (`/fp:precise` vs GCC's contraction defaults; `std::` math
-  differences) and the SPIR-V compiled on Windows. A gradient that is exactly 0
-  where finite differences give -0.0429 looks like a code path that was skipped
-  (a compile-time branch or an unsupported feature), not rounding.
-- `MaskedSSIMMetricTest.AllSupportedMapsMatchUnmaskedMaps` (3 ULP, Vulkan only):
-  compare with a ULP tolerance, unless the test intentionally requires bitwise
-  equality.
+<!-- GPU-NUMERICS -->
 
-### 7. Other
+<!-- GRADIENTS-TEARDOWN -->
 
-| Test | Likely cause / next step |
-| --- | --- |
-| `MeshDataTest.ProcessExitsCleanlyAfterMesh2Splat` (Vulkan) | Stack overflow (0xC00000FD) in the child. The default Windows stack is 1 MB (8 MB on Linux), so look for a deep recursion or a large stack array in mesh2splat or exit-time teardown. Get a dump with `procdump -e` |
-| `Backends/ExpressionTest.CpuScalarUsesInlineParameters/Vulkan` | 3 more VMA objects after the test. Probably lazily created caches (staging buffers) that are created on first use on this driver. Check whether the count is stable on a second run in the same process |
-| `HostMetrics.CpuAndPerCoreBecomeValidAfterSecondSample` | `GetProcessTimes` has ~15.6 ms resolution. If the two samples are closer than that, the delta is 0 and the code reports -1. Sleep past one tick between samples, or treat a zero interval as "not yet valid" |
-| `LpipsOpsTest.RejectsOperandDtypesBeforeLaunching` | The error text comes from a different layer on Windows. Print the report and compare with Linux |
-| `SessionBreadcrumbTest.SnapshotsOnlyTheUncleanPreviousLogTail` | Probably CRLF, or the log not flushed or still open when the snapshot is read (see group 1) |
-| `NvCodecSentinelValidatorTest.SkippedMemberIsRetriedOrFailsHardBeforeReturn` | Driver/NVDEC version dependent. Compare with Linux on the same GPU and driver branch |
-| `TensorReserveInplaceCatCuda.AllocationFailurePreservesInstalledStorage` | Under WDDM, allocations can exceed physical memory (the system pages to host memory), so "more than total device memory" can succeed. Skip on WDDM (`cudaDeviceProp::tccDriver == 0` on Windows) or use a size above the address-space limit |
-| `ViewerGpuMemory.CudaStatusKeepsDeviceUsageAndItsOptionalUtilizationReading` | Windows reports a process budget (DXGI), Linux does not. The test should accept a budget when the platform provides one |
-| `VideoFrameExtractorTrim.SparseFpsStopsAtTheLastDecodableFrameInAStreamCopy` | The strategy choice depends on the FFmpeg build (keyframe index or seek support). Compare `av_version_info()` with the Linux build |
-| `VideoExportUtilsTest.EquirectangularMarkerPixelsFollowViewportCamera` | Flaky (1 of 4). Run with `--gtest_repeat=50` to get a failure rate, and look for an unsynchronized readback |
-| `lichtfeld_tests` exits with 0xC0000005 after the report | Static destruction order: a singleton (CUDA, Vulkan, pinned allocator, logger) is used after its DLL or driver shut down. Get a dump with `procdump -e -x . lichtfeld_tests.exe` and fix the order, or skip work in destructors once shutdown has started |
+## Keep Windows from regressing
 
-### 8. Keep Windows from regressing
-
-Windows CI doesn't build the test programs
+Windows CI doesn't build `lichtfeld_tests`. It builds only the standalone
+`unicode_path_test`, which leaves out the tests under `LFS_HAS_FULL_LIBRARY`
 ([#677](https://github.com/MrNeRF/LichtFeld-Studio/issues/677),
-[#1481](https://github.com/MrNeRF/LichtFeld-Studio/issues/1481)). Even
-without a GPU runner, building them with `-DBUILD_TESTS=ON` in the Windows job
-(build only, no run) would have caught all of #3944. Running the CPU-labelled
-`ctest -L cpu` subset would also catch most of groups 1–4.
+[#1481](https://github.com/MrNeRF/LichtFeld-Studio/issues/1481)).
+
+- **Build only.** Building the three test programs with `-DBUILD_TESTS=ON` in the Windows
+  job, without running them, would have caught all of #3944.
+- **CPU subset.** Running `ctest -L cpu` would catch most of the file, path and Unicode
+  bugs above. Those are the ones that affect users too.
