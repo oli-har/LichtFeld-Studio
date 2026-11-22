@@ -33,10 +33,12 @@ namespace lfs::training {
         constexpr std::array<uint32_t, 4> kRidgeRadii{3, 5, 7, 10};
         constexpr size_t kRidgeTaps = 7 + 11 + 15 + 21;
         constexpr uint32_t kRidgeTileWidth = 16, kRidgeTileHeight = 32;
-        // Operations 2 and 3 of structure_main reduce over at most kRidgeGroups groups and keep their partial sums in
-        // runs of kRidgeGroups: the response sum, the luma minimum and maximum, and with a mask the kept-pixel count,
-        // the layout RidgeWorkspace::ensure_size allocates for the template.
+        // Operation 2 of structure_main reduces over at most kRidgeGroups groups and keeps their partial sums in runs
+        // of kRidgeGroups: the response sum, the luma minimum and maximum, and with a mask the kept-pixel count, the
+        // layout RidgeWorkspace::ensure_size allocates for the template. Operation 3 reduces them once and stores the
+        // map's normalization scale after the fourth run (kRidgeScale), which operation 9 applies.
         constexpr size_t kRidgeGroups = 1024;
+        constexpr size_t kRidgeScale = 4 * kRidgeGroups;
         struct RidgeParams {
             uint64_t image = 0, mask = 0, output = 0;
             int32_t width = 0, height = 0;
@@ -65,7 +67,7 @@ namespace lfs::training {
             }
             LFS_ASSERT((output.shape() == core::TensorShape{h, w}));
             LFS_ASSERT(output.dtype() == core::DataType::Float32 && output.is_contiguous());
-            const size_t reduction = (masked ? 4 : 3) * kRidgeGroups;
+            const size_t reduction = kRidgeScale + 1;
             if (!workspace.reduction.is_valid() || workspace.reduction.numel() < reduction)
                 workspace.reduction = core::Tensor::empty({reduction}, core::Device::GPU);
 
@@ -113,7 +115,8 @@ namespace lfs::training {
             q.reserved = p.mask_mode;
             q.blocks = static_cast<uint32_t>(std::min((h * w + 255) / 256, kRidgeGroups));
             Backend::launch(2, q, {&image, &mask, &output}, {&workspace.reduction}, size_t(q.blocks) * 256);
-            Backend::launch(3, q, {&workspace.reduction, &output}, {&output}, h * w);
+            Backend::launch(3, q, {&workspace.reduction}, {&workspace.reduction}, 256); // one group
+            Backend::launch(9, q, {&workspace.reduction, &output}, {&output}, h * w);
         }
     } // namespace
     const gpu_ops::StructureOps& metal_structure_ops() {

@@ -175,10 +175,11 @@ kernel void structure_main(constant StructureParams& p [[buffer(0)]],
                     st_write(p.d, 3072 + group, valid_count);
             }
         } else if (operation == 3) {
-            if (i < uint(n)) {
+            // One group: the ridge map's normalization scale, after the four runs of partials; operation 9 applies it.
+            if (lane == 0) {
                 bool range_valid = p.e != 0 ? valid_count > 0.0f : value.z > value.y;
                 float count = p.e != 0 ? valid_count : float(n);
-                st_write(p.c, i, st_read(p.c, i) * (value.x > 0.0f && range_valid ? count / value.x : 0.0f));
+                st_write(p.d, 4096, value.x > 0.0f && range_valid ? count / value.x : 0.0f);
             }
         } else if (operation == 6) {
             if (lane == 0) {
@@ -207,6 +208,11 @@ kernel void structure_main(constant StructureParams& p [[buffer(0)]],
     if (operation == 5) {
         if (i < uint(n))
             st_write(p.a, i, st_read(p.a, i) * (1.0f + p.gain * clamp(st_read(p.b, i), 0.0f, 4.0f)));
+        return;
+    }
+    if (operation == 9) {
+        if (i < uint(n))
+            st_write(p.c, i, st_read(p.c, i) * st_read(p.d, 4096));
         return;
     }
     if (operation == 8) {
