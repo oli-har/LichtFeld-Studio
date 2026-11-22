@@ -547,20 +547,24 @@ struct PpispBackwardParams {
 // Gradient slots per threadgroup: exposure, color[8], vignetting[15], CRF[12].
 constant constexpr int kPpispGradients = 36;
 
+// Each thread takes every threads-th pixel (about 16, as the host sizes the grid) and sums the parameter gradients
+// of its pixels in registers, so the 36 SIMD sums and the threadgroup's 36 atomics run once per thread and group
+// rather than per pixel and per 256 pixels.
 kernel void ppisp_backward(constant PpispBackwardParams& p [[buffer(0)]], uint index [[thread_position_in_grid]],
-                           uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]],
-                           uint simds [[simdgroups_per_threadgroup]], uint local [[thread_index_in_threadgroup]]) {
+                           uint threads [[threads_per_grid]], uint lane [[thread_index_in_simdgroup]],
+                           uint simd [[simdgroup_index_in_threadgroup]], uint simds [[simdgroups_per_threadgroup]],
+                           uint local [[thread_index_in_threadgroup]]) {
     // Simdgroup sums of every gradient slot; one barrier serves all 36 group sums.
     threadgroup float partials[kPpispGradients][kThreadgroupWidth / 32];
     float g[kPpispGradients];
     for (int i = 0; i < kPpispGradients; ++i)
         g[i] = 0.0f;
     const int pixels = p.height * p.width;
-    if (int(index) < pixels) {
-        const int y = int(index) / p.width;
-        const int x = int(index) % p.width;
-        const float3 rgb_input = float3(p.rgb_in[index], p.rgb_in[pixels + index], p.rgb_in[2 * pixels + index]);
-        const float2 pixel = float2(float(x) + 0.5f, float(y) + 0.5f);
+    for (int pixel = int(index); pixel < pixels; pixel += int(threads)) {
+        const int y = pixel / p.width;
+        const int x = pixel % p.width;
+        const float3 rgb_input = float3(p.rgb_in[pixel], p.rgb_in[pixels + pixel], p.rgb_in[2 * pixels + pixel]);
+        const float2 position = float2(float(x) + 0.5f, float(y) + 0.5f);
         device const float* vignetting = p.vignetting + p.camera_index * 15;
         device const float* crf = p.crf + p.camera_index * 12;
 
@@ -571,7 +575,7 @@ kernel void ppisp_backward(constant PpispBackwardParams& p [[buffer(0)]], uint i
             rgb = after_exposure;
         }
         if (p.camera_index != -1) {
-            after_vignetting = ppisp_apply_vignetting(rgb, vignetting, pixel, float(p.width), float(p.height));
+            after_vignetting = ppisp_apply_vignetting(rgb, vignetting, position, float(p.width), float(p.height));
             rgb = after_vignetting;
         } else {
             after_vignetting = rgb;
@@ -582,20 +586,23 @@ kernel void ppisp_backward(constant PpispBackwardParams& p [[buffer(0)]], uint i
             after_color = rgb;
         }
 
-        float3 grad = float3(p.grad_rgb_out[index], p.grad_rgb_out[pixels + index], p.grad_rgb_out[2 * pixels + index]);
+        float3 grad = float3(p.grad_rgb_out[pixel], p.grad_rgb_out[pixels + pixel], p.grad_rgb_out[2 * pixels + pixel]);
         if (p.camera_index != -1)
             grad = ppisp_apply_crf_bwd(after_color, crf, grad, g + 24);
         if (p.frame_index != -1)
             grad = ppisp_apply_color_correction_bwd(after_vignetting, ppisp_load_color(p.color + p.frame_index * 8),
                                                     grad, g + 1);
         if (p.camera_index != -1)
-            grad = ppisp_apply_vignetting_bwd(after_exposure, vignetting, pixel, float(p.width), float(p.height),
+            grad = ppisp_apply_vignetting_bwd(after_exposure, vignetting, position, float(p.width), float(p.height),
                                               grad, g + 9);
-        if (p.frame_index != -1)
-            grad = ppisp_apply_exposure_bwd(rgb_input, p.exposure[p.frame_index], grad, g[0]);
-        p.grad_rgb_in[index] = grad.x;
-        p.grad_rgb_in[pixels + index] = grad.y;
-        p.grad_rgb_in[2 * pixels + index] = grad.z;
+        if (p.frame_index != -1) {
+            float grad_exposure;
+            grad = ppisp_apply_exposure_bwd(rgb_input, p.exposure[p.frame_index], grad, grad_exposure);
+            g[0] += grad_exposure;
+        }
+        p.grad_rgb_in[pixel] = grad.x;
+        p.grad_rgb_in[pixels + pixel] = grad.y;
+        p.grad_rgb_in[2 * pixels + pixel] = grad.z;
     }
 
     for (int i = 0; i < kPpispGradients; ++i) {
