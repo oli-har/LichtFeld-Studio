@@ -432,7 +432,7 @@ namespace lfs::training {
             int32_t height, width, channels;
             uint32_t tiles_x, tiles_y;
             float ssim_weight, grad_per_pixel;
-            uint32_t valid_padding, masked, has_sigma;
+            uint32_t valid_padding, masked;
         };
 
         // ssim.cu crops the backward per axis like the forward.
@@ -462,9 +462,9 @@ namespace lfs::training {
                 .grad_per_pixel = masked ? 0.f : grad_per_pixel(images, valid_padding),
                 .valid_padding = valid_padding ? 1u : 0u,
                 .masked = masked ? 1u : 0u,
-                .has_sigma = dm_sigma1.is_valid() ? 1u : 0u,
             };
-            launch_with("photo_ssim_backward", params,
+            // Without sigma partials (the decoupled corrected image) only dm_mu is convolved.
+            launch_with(dm_sigma1.is_valid() ? "photo_ssim_backward" : "photo_ssim_backward_mu", params,
                         {&prediction, &images.target, &images.mask, &mask_sum, &dm_mu, &dm_sigma1, &dm_sigma12, &grad},
                         {tiles_x(images), tiles_y(images) * static_cast<uint32_t>(images.n), 1}, {kTile, kTile, 1},
                         Constants(images, kLossNone, false));

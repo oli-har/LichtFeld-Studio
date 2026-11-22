@@ -16,6 +16,9 @@
 #include "core/tensor_upload.hpp"
 #include "lfs/training/ops/registry.hpp"
 #include "lfs/training/ops/structure.hpp"
+#ifdef LFS_TENSOR_METAL
+#include "ops/metal_kernels.hpp"
+#endif
 
 #include <gtest/gtest.h>
 
@@ -461,6 +464,94 @@ namespace {
         check_photo(*table_, {ops::PhotoPath::MaskedDecoupled, fixture}, "masked_decoupled_soft", 3e-6);
         check_photo(*table_, {ops::PhotoPath::MaskedDecoupled, odd, true, true}, "masked_decoupled_batch_u8");
     }
+
+#ifdef LFS_TENSOR_METAL
+    // photo_ssim_backward_mu, the SSIM backward of the decoupled corrected image, convolves dm_mu alone: the sigma
+    // partials' terms it leaves out add zeros. Launched as photometric_metal.cpp launches them for the unmasked and
+    // the masked decoupled path, it gives photo_ssim_backward's gradient for zero sigma partials up to float
+    // rounding; both also match the CPU reference.
+    TEST_P(PortableLosses, SsimBackwardMuMatchesZeroSigmaPartials) {
+        if (GetParam() != GpuBackend::Metal)
+            GTEST_SKIP() << "Metal kernels";
+        namespace mk = lfs::training::metal;
+        // PhotoBackwardParams in photometric.metal.
+        struct Params {
+            uint64_t prediction, target, mask, mask_sum, dm_mu, dm_sigma1, dm_sigma12, grad;
+            int32_t height, width, channels;
+            uint32_t tiles_x, tiles_y;
+            float ssim_weight, grad_per_pixel;
+            uint32_t valid_padding, masked;
+        };
+        struct Variant {
+            const char* name;
+            bool masked, padding, mask_bytes;
+        };
+        constexpr float kWeight = 0.2f;
+        constexpr uint32_t kTile = 16;
+        for (const Shape4& s : {Shape4{1, 3, 37, 45}, Shape4{2, 3, 21, 27}})
+            for (const bool target_bytes : {false, true})
+                for (const Variant& v : {Variant{"valid padding", false, true, false}, Variant{"no padding", false, false, false},
+                                         Variant{"float mask", true, false, false}, Variant{"byte mask", true, false, true}}) {
+                    SCOPED_TRACE(std::format("{}x{}x{}, {} target, {}", s.n, s.h, s.w, target_bytes ? "u8" : "f32", v.name));
+                    const PhotoInputs in = photo_inputs({ops::PhotoPath::MaskedDecoupled, s, target_bytes, v.mask_bytes}, 29);
+                    const Tensor dm_mu = upload(uniform(s.numel(), 41, -1.f, 1.f), s.tensor()).to(DataType::Float16);
+                    const Tensor zero_sigma = Tensor::zeros(s.tensor(), Device::GPU, DataType::Float16);
+                    const Tensor mask = v.masked ? in.mask : Tensor{};
+                    // The masked chain divides by the forward's normalization, mask sum * N * C + eps.
+                    double mask_total = 0.0;
+                    for (const double m : in.hmask)
+                        mask_total += m;
+                    const double normalized = static_cast<float>(mask_total) * s.n * s.c + 1e-8;
+                    const Tensor mask_sum = v.masked ? upload({static_cast<float>(normalized)}, TensorShape({1})) : Tensor{};
+                    Field chain = valid_chain(s, v.padding);
+                    if (v.masked)
+                        for (size_t i = 0; i < chain.size(); ++i)
+                            chain[i] = in.hmask[i] / normalized;
+                    const int h = v.padding && s.h > 10 ? s.h - 10 : s.h, w = v.padding && s.w > 10 ? s.w - 10 : s.w;
+                    const float grad_per_pixel = v.masked ? 0.f : 1.0f / static_cast<float>(static_cast<double>(s.n) * s.c * h * w);
+                    const uint32_t tiles_x = (static_cast<uint32_t>(s.w) + kTile - 1) / kTile;
+                    const uint32_t tiles_y = (static_cast<uint32_t>(s.h) + kTile - 1) / kTile;
+                    const auto run = [&](const std::string_view function, const Tensor& sigma) {
+                        const Tensor grad = Tensor::zeros(s.tensor(), Device::GPU);
+                        const Params params{.prediction = mk::address(in.x),
+                                            .target = mk::address(in.y),
+                                            .mask = mk::address(mask),
+                                            .mask_sum = mk::address(mask_sum),
+                                            .dm_mu = mk::address(dm_mu),
+                                            .dm_sigma1 = mk::address(sigma),
+                                            .dm_sigma12 = mk::address(sigma),
+                                            .grad = mk::address(grad),
+                                            .height = s.h,
+                                            .width = s.w,
+                                            .channels = s.c,
+                                            .tiles_x = tiles_x,
+                                            .tiles_y = tiles_y,
+                                            .ssim_weight = kWeight,
+                                            .grad_per_pixel = grad_per_pixel,
+                                            .valid_padding = v.padding ? 1u : 0u,
+                                            .masked = v.masked ? 1u : 0u};
+                        mk::launch_2d(function, params, {&in.x, &in.y, &mask, &mask_sum, &dm_mu, &sigma, &sigma, &grad},
+                                      tiles_x, tiles_y * static_cast<uint32_t>(s.n), kTile, kTile,
+                                      {{40, target_bytes ? 1u : 0u}, {41, v.mask_bytes ? 1u : 0u}, {42, 0u}, {43, 0u}});
+                        return download(grad);
+                    };
+                    const std::vector<float> mu = run("photo_ssim_backward_mu", Tensor{});
+                    const std::vector<float> full = run("photo_ssim_backward", zero_sigma);
+                    // The kernels are two fast-math specializations of one template, so the compiler may order the dm_mu
+                    // sums differently in each (on an Apple M3 Ultra they agree bit for bit in all 16 cases). Another
+                    // order moves an 11-tap sum by at most 10 float epsilons of its terms' magnitudes, which stay below
+                    // 0.2 (the SSIM weight times |dm_mu| < 1) of the chain factor, while the L1 term keeps the largest
+                    // gradient above 0.6 of it: both passes and the final multiply-add stay within 8 epsilons of the
+                    // largest gradient magnitude.
+                    expect_field(mu, widen(full), 0.0, 8.0 * std::numeric_limits<float>::epsilon(),
+                                 "photo_ssim_backward_mu against photo_ssim_backward");
+                    const Field want = ssim_backward(in.hx, in.hy, widen(download(dm_mu)), nullptr, nullptr, chain, kWeight, s,
+                                                     v.masked ? in.hmask : Field{});
+                    expect_field(mu, want, 1e-9, 2e-4, "photo_ssim_backward_mu");
+                    expect_field(full, want, 1e-9, 2e-4, "photo_ssim_backward");
+                }
+    }
+#endif
 
     // Central differences of the GPU loss 1 - SSIM against the GPU gradient.
     TEST_P(PortableLosses, SsimGradientMatchesFiniteDifferences) {
