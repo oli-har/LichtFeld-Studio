@@ -27,6 +27,8 @@ int st_reflect(int i, int n) {
     i %= 2 * n;
     return i < n ? i : 2 * n - 1 - i;
 }
+// st_reflect without the division when i lies inside the image.
+inline int st_reflect_fast(int i, int n) { return i >= 0 && i < n ? i : st_reflect(i, n); }
 bool st_interior(constant StructureParams& p, int x, int y) { return x > 0 && x < p.width - 1 && y > 0 && y < p.height - 1; }
 float st_sx(int x, int y) { return float(x) * (y == 0 ? 2.0f : 1.0f) * 0.125f; }
 float st_sy(int x, int y) { return float(y) * (x == 0 ? 2.0f : 1.0f) * 0.125f; }
@@ -258,7 +260,8 @@ kernel void structure_main(constant StructureParams& p [[buffer(0)]],
 // into threadgroup memory once. Each scale then runs its separable Hessian from there: horizontal sums g, d1, d2 over
 // the tile rows and that scale's halo rows, then the vertical sums per output pixel, the same fma chains in the same
 // order as the band passes of structure_gpu.hpp, whose per-scale filters StructureRidgeParams packs back to back. A
-// pixel keeps the largest response of the scales whose window lies on kept pixels, 0 if even the smallest does not.
+// pixel keeps the largest response of the scales whose window lies on kept pixels, 0 if even the smallest does not:
+// scale r's window is kept when the pixel's Chebyshev distance to the nearest hidden span cell exceeds r.
 // Threadgroup memory: 52x36 floats and bytes for the span, 3x52x16 floats for the horizontal sums: 19,344 bytes.
 constant constexpr int kRidgeTileWidth = 16;
 constant constexpr int kRidgeTileHeight = 32;
@@ -276,49 +279,49 @@ struct StructureRidgeParams {
     float filter_g[kRidgeTaps], filter_d1[kRidgeTaps], filter_d2[kRidgeTaps];
 };
 
-// One scale: Radius, and Offset of its filters in StructureRidgeParams.
+// One scale: Radius, and Offset of its filters in StructureRidgeParams. Column pairs share their taps' loads.
 template <int Radius, int Offset>
 static void st_ridge_scale(constant StructureRidgeParams& p, const float sigma_sq, threadgroup const float* luma,
-                           threadgroup const uchar* keeps, threadgroup float* horizontal_g,
-                           threadgroup float* horizontal_d1, threadgroup float* horizontal_d2, const uint2 local,
-                           const uint rank, const bool inside, const bool masked, const bool first,
-                           thread float& best) {
+                           threadgroup float* horizontal_g, threadgroup float* horizontal_d1,
+                           threadgroup float* horizontal_d2, const uint2 local, const uint rank, const bool kept,
+                           const bool first, thread float& best) {
     constexpr int taps = 2 * Radius + 1;
-    constexpr int cells = (kRidgeTileHeight + 2 * Radius) * kRidgeTileWidth;
-    for (uint cell = rank; cell < uint(cells); cell += kRidgeThreads) {
-        const int start = (kRidgeHalo - Radius + int(cell) / kRidgeTileWidth) * kRidgeSpanWidth +
-                          int(cell) % kRidgeTileWidth + kRidgeHalo - Radius;
-        float g = 0, d1 = 0, d2 = 0;
-        bool valid = true;
+    constexpr uint pairs = uint(kRidgeTileHeight + 2 * Radius) * uint(kRidgeTileWidth / 2);
+    if (rank < pairs) {
+        const int row = int(rank) / (kRidgeTileWidth / 2), column = 2 * (int(rank) % (kRidgeTileWidth / 2));
+        const int start = (kRidgeHalo - Radius + row) * kRidgeSpanWidth + column + kRidgeHalo - Radius;
+        float g0 = 0, d10 = 0, d20 = 0, g1 = 0, d11 = 0, d21 = 0;
+        float v1 = luma[start];
         for (int j = 0; j < taps; ++j) {
-            valid = valid && keeps[start + j] != 0;
-            const float v = luma[start + j];
-            g = fma(v, p.filter_g[Offset + j], g);
-            d1 = fma(v, p.filter_d1[Offset + j], d1);
-            d2 = fma(v, p.filter_d2[Offset + j], d2);
+            const float v0 = v1;
+            v1 = luma[start + j + 1];
+            g0 = fma(v0, p.filter_g[Offset + j], g0);
+            d10 = fma(v0, p.filter_d1[Offset + j], d10);
+            d20 = fma(v0, p.filter_d2[Offset + j], d20);
+            g1 = fma(v1, p.filter_g[Offset + j], g1);
+            d11 = fma(v1, p.filter_d1[Offset + j], d11);
+            d21 = fma(v1, p.filter_d2[Offset + j], d21);
         }
-        const float result = valid ? g : as_type<float>(0xff800000u);
-        horizontal_g[cell] = result;
-        horizontal_d1[cell] = valid ? d1 : result;
-        horizontal_d2[cell] = valid ? d2 : result;
+        const int cell = row * kRidgeTileWidth + column;
+        horizontal_g[cell] = g0;
+        horizontal_d1[cell] = d10;
+        horizontal_d2[cell] = d20;
+        horizontal_g[cell + 1] = g1;
+        horizontal_d1[cell + 1] = d11;
+        horizontal_d2[cell + 1] = d21;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (inside) {
+    if (kept) {
         const int column = int(local.y) * kRidgeTileWidth + int(local.x);
-        bool valid = true;
-        for (int j = 0; masked && j < taps; ++j)
-            valid = valid && !st_invalid_response(horizontal_g[column + j * kRidgeTileWidth]);
-        if (valid) {
-            float hxx = 0, hxy = 0, hyy = 0;
-            for (int j = 0; j < taps; ++j) {
-                const int cell = column + j * kRidgeTileWidth;
-                hxx = fma(horizontal_d2[cell], p.filter_g[Offset + j], hxx);
-                hxy = fma(horizontal_d1[cell], p.filter_d1[Offset + j], hxy);
-                hyy = fma(horizontal_g[cell], p.filter_d2[Offset + j], hyy);
-            }
-            const float response = st_ridge_response(hxx, hxy, hyy, sigma_sq);
-            best = first ? response : max(best, response);
+        float hxx = 0, hxy = 0, hyy = 0;
+        for (int j = 0; j < taps; ++j) {
+            const int cell = column + j * kRidgeTileWidth;
+            hxx = fma(horizontal_d2[cell], p.filter_g[Offset + j], hxx);
+            hxy = fma(horizontal_d1[cell], p.filter_d1[Offset + j], hxy);
+            hyy = fma(horizontal_g[cell], p.filter_d2[Offset + j], hyy);
         }
+        const float response = st_ridge_response(hxx, hxy, hyy, sigma_sq);
+        best = first ? response : max(best, response);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
@@ -328,31 +331,53 @@ kernel void structure_ridge(constant StructureRidgeParams& p [[buffer(0)]],
                             uint2 local [[thread_position_in_threadgroup]],
                             uint rank [[thread_index_in_threadgroup]]) {
     threadgroup float luma[kRidgeSpanHeight * kRidgeSpanWidth];
-    threadgroup uchar keeps[kRidgeSpanHeight * kRidgeSpanWidth];
+    threadgroup uchar hidden_distance[kRidgeSpanHeight * kRidgeSpanWidth];
     threadgroup float horizontal_g[kRidgeSpanHeight * kRidgeTileWidth];
     threadgroup float horizontal_d1[kRidgeSpanHeight * kRidgeTileWidth];
     threadgroup float horizontal_d2[kRidgeSpanHeight * kRidgeTileWidth];
+    constexpr uchar kFar = kRidgeHalo + 1;
     const int x0 = int(group.x) * kRidgeTileWidth, y0 = int(group.y) * kRidgeTileHeight;
     const int n = p.width * p.height;
     for (uint cell = rank; cell < uint(kRidgeSpanHeight * kRidgeSpanWidth); cell += kRidgeThreads) {
-        const int row = st_reflect(y0 - kRidgeHalo + int(cell) / kRidgeSpanWidth, p.height);
-        const int column = st_reflect(x0 - kRidgeHalo + int(cell) % kRidgeSpanWidth, p.width);
+        const int row = st_reflect_fast(y0 - kRidgeHalo + int(cell) / kRidgeSpanWidth, p.height);
+        const int column = st_reflect_fast(x0 - kRidgeHalo + int(cell) % kRidgeSpanWidth, p.width);
         const int source = row * p.width + column;
         luma[cell] = st_luma_at(p.image, n, p.image_byte, source);
-        keeps[cell] = st_keeps_at(p.mask, p.mask_byte, p.mask_mode, source) ? 1 : 0;
+        hidden_distance[cell] = st_keeps_at(p.mask, p.mask_byte, p.mask_mode, source) ? kFar : 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Each span row's distance to its nearest hidden cell, capped at kFar: one thread scans a row both ways.
+    if (p.mask != 0 && rank < uint(kRidgeSpanHeight)) {
+        threadgroup uchar* row = hidden_distance + rank * kRidgeSpanWidth;
+        uchar distance = kFar;
+        for (int c = 0; c < kRidgeSpanWidth; ++c) {
+            distance = row[c] == 0 ? 0 : min(uchar(distance + 1), kFar);
+            row[c] = distance;
+        }
+        distance = kFar;
+        for (int c = kRidgeSpanWidth - 1; c >= 0; --c) {
+            distance = row[c] == 0 ? 0 : min(uchar(distance + 1), kFar);
+            row[c] = min(row[c], distance);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const int x = x0 + int(local.x), y = y0 + int(local.y);
-    const bool inside = x < p.width && y < p.height, masked = p.mask != 0;
+    const bool inside = x < p.width && y < p.height;
+    // Chebyshev distance of the output pixel to the nearest hidden span cell, capped at kFar.
+    int distance = kFar;
+    for (int j = -kRidgeHalo; j <= kRidgeHalo; ++j) {
+        const int row = int(local.y) + kRidgeHalo + j;
+        distance = min(distance, max(abs(j), int(hidden_distance[row * kRidgeSpanWidth + int(local.x) + kRidgeHalo])));
+    }
     float best = 0.0f;
-    st_ridge_scale<3, 0>(p, p.sigma_sq[0], luma, keeps, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
-                         inside, masked, true, best);
-    st_ridge_scale<5, 7>(p, p.sigma_sq[1], luma, keeps, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
-                         inside, masked, false, best);
-    st_ridge_scale<7, 18>(p, p.sigma_sq[2], luma, keeps, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
-                          inside, masked, false, best);
-    st_ridge_scale<10, 33>(p, p.sigma_sq[3], luma, keeps, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
-                           inside, masked, false, best);
+    st_ridge_scale<3, 0>(p, p.sigma_sq[0], luma, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
+                         inside && distance > 3, true, best);
+    st_ridge_scale<5, 7>(p, p.sigma_sq[1], luma, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
+                         inside && distance > 5, false, best);
+    st_ridge_scale<7, 18>(p, p.sigma_sq[2], luma, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
+                          inside && distance > 7, false, best);
+    st_ridge_scale<10, 33>(p, p.sigma_sq[3], luma, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
+                           inside && distance > 10, false, best);
     if (inside)
         st_write(p.output, y * p.width + x, best);
 }
