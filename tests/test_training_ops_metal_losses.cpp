@@ -1862,6 +1862,199 @@ namespace {
         download(loss);
     }
 
+    // ---- Thin-structure ridge map (structure.metal) ----------------------------------------------------------
+
+    struct RidgeCase {
+        size_t h, w;
+        DataType image;
+        std::optional<DataType> mask; // none, or the mask's dtype
+        ops::MaskPhotoMode mode = ops::MaskPhotoMode::BinaryGt0;
+    };
+
+    std::string ridge_case_name(const RidgeCase& c) {
+        const char* const mask = !c.mask                      ? "nomask"
+                                 : *c.mask == DataType::UInt8 ? "u8mask"
+                                                              : "f32mask";
+        return std::format("{}x{}_{}_{}{}", c.h, c.w, c.image == DataType::UInt8 ? "u8" : "f32", mask,
+                           c.mask && c.mode == ops::MaskPhotoMode::SegmentAndIgnore ? "_segment" : "");
+    }
+
+    // Stripes with thin bright columns and dark rows, so every scale responds. Masks hide a block and two single
+    // pixels; the segment mode also gets a band just below its keep threshold (250, hidden) and one just above (251).
+    struct RidgeHost {
+        std::vector<float> image, mask;
+        std::vector<uint8_t> image_bytes, mask_bytes;
+    };
+
+    RidgeHost ridge_host(const RidgeCase& c) {
+        const size_t n = c.h * c.w;
+        RidgeHost host;
+        host.image.resize(3 * n);
+        for (size_t ch = 0; ch < 3; ++ch)
+            for (size_t y = 0; y < c.h; ++y)
+                for (size_t x = 0; x < c.w; ++x) {
+                    float v = 0.2f + 0.5f * static_cast<float>((x * 7 + y * 3 + ch * 11) % 23) / 23.0f;
+                    v += x % 9 == 4 ? 0.25f : 0.0f;
+                    v -= y % 13 == 6 ? 0.15f : 0.0f;
+                    host.image[(ch * c.h + y) * c.w + x] = std::clamp(v, 0.0f, 1.0f);
+                }
+        host.image_bytes.resize(host.image.size());
+        for (size_t i = 0; i < host.image.size(); ++i)
+            host.image_bytes[i] = static_cast<uint8_t>(std::lround(host.image[i] * 255.0f));
+        if (!c.mask)
+            return host;
+        const bool segment = c.mode == ops::MaskPhotoMode::SegmentAndIgnore;
+        host.mask.resize(n);
+        host.mask_bytes.resize(n);
+        for (size_t y = 0; y < c.h; ++y)
+            for (size_t x = 0; x < c.w; ++x) {
+                const size_t i = y * c.w + x;
+                const bool hidden = (x >= c.w / 3 && x < c.w / 2 && y >= c.h / 4 && y < c.h / 2) ||
+                                    (x == c.w - 3 && y == c.h / 5) || (x == 2 && y == c.h - 3);
+                if (segment) {
+                    host.mask_bytes[i] = hidden ? 0 : x < c.w / 6 ? 250
+                                                  : y < c.h / 6   ? 251
+                                                                  : 255;
+                    host.mask[i] = static_cast<float>(host.mask_bytes[i]) / 255.0f;
+                } else {
+                    host.mask_bytes[i] = hidden ? 0 : static_cast<uint8_t>(1 + i % 200);
+                    host.mask[i] = hidden ? 0.0f : i % 11 == 0 ? 1.0e-6f
+                                                               : 0.25f + 0.75f * static_cast<float>(i % 13) / 12.0f;
+                }
+            }
+        return host;
+    }
+
+    std::pair<Tensor, Tensor> ridge_inputs(const RidgeCase& c) {
+        const RidgeHost host = ridge_host(c);
+        const Tensor image = c.image == DataType::UInt8 ? upload_bytes(host.image_bytes, TensorShape({3, c.h, c.w}))
+                                                        : upload(host.image, TensorShape({3, c.h, c.w}));
+        if (!c.mask)
+            return {image, Tensor{}};
+        const TensorShape plane({c.h, c.w});
+        return {image, *c.mask == DataType::UInt8 ? upload_bytes(host.mask_bytes, plane) : upload(host.mask, plane)};
+    }
+
+    // The ridge map on the CPU in double: the filters of structure_gpu.hpp (rounded to float, as the kernels get
+    // them), its separable passes as plain loops over reflected rows and columns, then the normalization of
+    // structure_main operations 2 and 3.
+    std::vector<double> ridge_reference(const RidgeCase& c, const RidgeHost& host) {
+        const int h = static_cast<int>(c.h), w = static_cast<int>(c.w);
+        const size_t n = c.h * c.w;
+        const bool bytes = c.image == DataType::UInt8, segment = c.mode == ops::MaskPhotoMode::SegmentAndIgnore;
+        std::vector<double> luma(n);
+        std::vector<char> keep(n, 1);
+        for (size_t i = 0; i < n; ++i) {
+            const auto channel = [&](const size_t ch) {
+                return bytes ? static_cast<double>(host.image_bytes[ch * n + i]) / 255.0
+                             : static_cast<double>(host.image[ch * n + i]);
+            };
+            luma[i] = 0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2);
+            if (c.mask) {
+                const bool mask_bytes = *c.mask == DataType::UInt8;
+                keep[i] = segment ? (mask_bytes ? host.mask_bytes[i] > 250 : host.mask[i] > 250.5f / 255.0f)
+                                  : (mask_bytes ? host.mask_bytes[i] != 0 : host.mask[i] > 0.0f);
+            }
+        }
+        const auto reflect = [](int i, const int size) {
+            if (i < 0)
+                i = -i - 1;
+            i %= 2 * size;
+            return i < size ? i : 2 * size - 1 - i;
+        };
+        std::vector<double> best(n, 0.0);
+        bool first = true;
+        for (const double sigma : {0.8, 1.2, 1.8, 2.5}) {
+            const int radius = static_cast<int>(4.0 * sigma + 0.5);
+            std::vector<double> fg, fd1, fd2;
+            double sum = 0;
+            for (int k = -radius; k <= radius; ++k)
+                sum += std::exp(-0.5 * k * k / (sigma * sigma));
+            for (int k = -radius; k <= radius; ++k) {
+                const double g = std::exp(-0.5 * k * k / (sigma * sigma)) / sum;
+                fg.push_back(static_cast<float>(g));
+                fd1.push_back(static_cast<float>(k * g / (sigma * sigma)));
+                fd2.push_back(static_cast<float>((k * k / (sigma * sigma) - 1.0) * g / (sigma * sigma)));
+            }
+            const double sigma_sq = static_cast<float>(sigma * sigma);
+            std::vector<double> hg(n), hd1(n), hd2(n);
+            std::vector<char> hvalid(n);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    double g = 0, d1 = 0, d2 = 0;
+                    bool valid = true;
+                    for (int k = -radius; k <= radius; ++k) {
+                        const size_t source = static_cast<size_t>(y) * w + reflect(x + k, w);
+                        valid = valid && keep[source];
+                        g += luma[source] * fg[k + radius];
+                        d1 += luma[source] * fd1[k + radius];
+                        d2 += luma[source] * fd2[k + radius];
+                    }
+                    const size_t i = static_cast<size_t>(y) * w + x;
+                    hg[i] = g;
+                    hd1[i] = d1;
+                    hd2[i] = d2;
+                    hvalid[i] = valid;
+                }
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    bool valid = true;
+                    double hxx = 0, hxy = 0, hyy = 0;
+                    for (int k = -radius; k <= radius; ++k) {
+                        const size_t source = static_cast<size_t>(reflect(y + k, h)) * w + x;
+                        valid = valid && hvalid[source];
+                        hxx += hd2[source] * fg[k + radius];
+                        hxy += hd1[source] * fd1[k + radius];
+                        hyy += hg[source] * fd2[k + radius];
+                    }
+                    if (!valid)
+                        continue;
+                    hxy *= sigma_sq;
+                    hyy *= sigma_sq;
+                    const double difference = hxx * sigma_sq - hyy, trace = hxx * sigma_sq + hyy;
+                    const double disc = std::sqrt(std::max(difference * difference + 4.0 * hxy * hxy, 0.0));
+                    const double a = std::abs(0.5 * (trace + disc)), b = std::abs(0.5 * (trace - disc));
+                    const double hi = std::max(a, b), lo = std::min(a, b);
+                    const size_t i = static_cast<size_t>(y) * w + x;
+                    const double response = hi * (hi - lo) / (hi + lo + 1e-6);
+                    best[i] = first ? response : std::max(best[i], response);
+                }
+            first = false;
+        }
+        double total = 0, count = 0, lowest = std::numeric_limits<double>::infinity(), highest = -lowest;
+        for (size_t i = 0; i < n; ++i) {
+            if (!keep[i])
+                continue;
+            total += best[i];
+            count += 1;
+            lowest = std::min(lowest, luma[i]);
+            highest = std::max(highest, luma[i]);
+        }
+        const bool range = c.mask ? count > 0 : highest > lowest;
+        const double scale = total > 0 && range ? (c.mask ? count : static_cast<double>(n)) / total : 0.0;
+        for (double& value : best)
+            value *= scale;
+        return best;
+    }
+
+    // The ridge map against ridge_reference, within float rounding: sizes below the 10-pixel halo (reflected more
+    // than once) and sizes that are not multiples of the 16x32 tile, u8 and float images, no mask, a float mask, and
+    // a byte mask in the segment-and-ignore mode.
+    TEST_P(PortableLosses, RidgeMapMatchesCpuReference) {
+        for (const auto& [h, w] : std::array<std::pair<size_t, size_t>, 4>{{{2, 3}, {5, 7}, {29, 37}, {33, 129}}})
+            for (const DataType image : {DataType::UInt8, DataType::Float32})
+                for (const RidgeCase& c : {RidgeCase{h, w, image, std::nullopt},
+                                           RidgeCase{h, w, image, DataType::Float32},
+                                           RidgeCase{h, w, image, DataType::UInt8, ops::MaskPhotoMode::SegmentAndIgnore}}) {
+                    SCOPED_TRACE(ridge_case_name(c));
+                    const auto [input, mask] = ridge_inputs(c);
+                    Tensor map = Tensor::empty({h, w}, Device::GPU);
+                    k::RidgeWorkspace workspace;
+                    table_->structure->ridge(input, map, workspace, mask, c.mode);
+                    expect_field(download(map), ridge_reference(c, ridge_host(c)), 1e-4, 1e-5, "ridge map");
+                }
+    }
+
     INSTANTIATE_TEST_SUITE_P(Backends, PortableLosses, testing::Values(GpuBackend::Metal, GpuBackend::Vulkan),
                              [](const auto& info) { return std::string(lfs::core::gpu_backend_name(info.param)); });
 

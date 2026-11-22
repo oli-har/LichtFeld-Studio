@@ -13,14 +13,14 @@ inline float st_read(ulong a, int i) { return ((device const float*)a)[i]; }
 inline uint st_byte(ulong a, int i) { return uint(((device const uchar*)a)[i]); }
 inline void st_write(ulong a, int i, float v) { ((device float*)a)[i] = v; }
 inline float st_value(ulong a, int i, uint byte_value) { return byte_value != 0 ? float(st_byte(a, i)) * (1.0f / 255.0f) : st_read(a, i); }
-float st_luma(constant StructureParams& p, int i) {
-    int n = p.width * p.height;
-    float r = p.image_byte != 0 ? float(st_byte(p.a, i)) : st_read(p.a, i);
-    float g = p.image_byte != 0 ? float(st_byte(p.a, n + i)) : st_read(p.a, n + i);
-    float b = p.image_byte != 0 ? float(st_byte(p.a, 2 * n + i)) : st_read(p.a, 2 * n + i);
+inline float st_luma_at(ulong image, int n, uint image_byte, int i) {
+    float r = image_byte != 0 ? float(st_byte(image, i)) : st_read(image, i);
+    float g = image_byte != 0 ? float(st_byte(image, n + i)) : st_read(image, n + i);
+    float b = image_byte != 0 ? float(st_byte(image, 2 * n + i)) : st_read(image, 2 * n + i);
     float value = fma(0.0722f, b, fma(0.2126f, r, 0.7152f * g));
-    return p.image_byte != 0 ? value * (1.0f / 255.0f) : value;
+    return image_byte != 0 ? value * (1.0f / 255.0f) : value;
 }
+float st_luma(constant StructureParams& p, int i) { return st_luma_at(p.a, p.width * p.height, p.image_byte, i); }
 int st_reflect(int i, int n) {
     if (i < 0)
         i = -i - 1;
@@ -35,14 +35,27 @@ float st_mask(constant StructureParams& p, int i) {
         return 1.0f;
     return p.mask_byte != 0 ? (st_byte(p.c, i) != 0 ? 1.0f : 0.0f) : st_read(p.c, i);
 }
-bool st_ridge_keeps(constant StructureParams& p, int i) {
-    if (p.e == 0)
+// mode 0 keeps mask > 0; mode 1 (segment and ignore) keeps the band above 250.
+inline bool st_keeps_at(ulong mask, uint mask_byte, uint mode, int i) {
+    if (mask == 0)
         return true;
-    if (p.reserved == 0)
-        return p.mask_byte != 0 ? st_byte(p.e, i) != 0 : st_read(p.e, i) > 0.0f;
-    return p.mask_byte != 0 ? st_byte(p.e, i) > 250u : st_read(p.e, i) > (250.5f / 255.0f);
+    if (mode == 0)
+        return mask_byte != 0 ? st_byte(mask, i) != 0 : st_read(mask, i) > 0.0f;
+    return mask_byte != 0 ? st_byte(mask, i) > 250u : st_read(mask, i) > (250.5f / 255.0f);
 }
+bool st_ridge_keeps(constant StructureParams& p, int i) { return st_keeps_at(p.e, p.mask_byte, p.reserved, i); }
 bool st_invalid_response(float value) { return as_type<uint>(value) == 0xff800000u; }
+// Ridge strength of one scale from its Hessian sums (hxy, hyy still without the sigma^2 normalization).
+inline float st_ridge_response(float hxx, float hxy, float hyy, float sigma_sq) {
+    hxy *= sigma_sq;
+    hyy *= sigma_sq;
+    float difference = fma(hxx, sigma_sq, -hyy);
+    float trace = fma(hxx, sigma_sq, hyy);
+    float disc = sqrt(max(fma(difference, difference, (4.0f * hxy) * hxy), 0.0f));
+    float a = abs(0.5f * (trace + disc)), b = abs(0.5f * (trace - disc));
+    float hi = max(a, b), lo = min(a, b);
+    return hi * (hi - lo) / (hi + lo + 1e-6f);
+}
 float st_residual(constant StructureParams& p, int i) {
     int n = p.width * p.height;
     return 0.2126f * (st_read(p.a, i) - st_value(p.b, i, p.image_byte)) +
@@ -58,61 +71,8 @@ kernel void structure_main(constant StructureParams& p [[buffer(0)]],
     threadgroup float residual[432], confidence[432], coefficient_x[340], coefficient_y[340];
     uint i = group * 256u + lane;
     int n = p.width * p.height;
-    if (operation == 0) {
-        if (i >= uint((p.rows + 2 * int(p.radius)) * p.width))
-            return;
-        int x = int(i) % p.width, row = st_reflect(p.first_row + int(i) / p.width - int(p.radius), p.height);
-        float g = 0, d1 = 0, d2 = 0;
-        bool valid = true;
-        for (int k = -int(p.radius); k <= int(p.radius); ++k) {
-            int source = row * p.width + st_reflect(x + k, p.width);
-            valid = valid && st_ridge_keeps(p, source);
-            float v = st_luma(p, source);
-            int j = k + int(p.radius);
-            g = fma(v, p.filter_g[j], g);
-            d1 = fma(v, p.filter_d1[j], d1);
-            d2 = fma(v, p.filter_d2[j], d2);
-        }
-        float result = valid ? g : as_type<float>(0xff800000u);
-        st_write(p.b, i, result);
-        st_write(p.b, p.stride + i, valid ? d1 : result);
-        st_write(p.b, 2 * p.stride + i, valid ? d2 : result);
-        return;
-    }
-    if (operation == 1) {
-        if (i >= uint(p.rows * p.width))
-            return;
-        int x = int(i) % p.width, by = int(i) / p.width, y = p.first_row + by;
-        if (y >= p.height)
-            return;
-        if (p.e != 0) {
-            for (int k = -int(p.radius); k <= int(p.radius); ++k) {
-                int source = (by + k + int(p.radius)) * p.width + x;
-                if (st_invalid_response(st_read(p.b, source))) {
-                    if (p.first_scale != 0)
-                        st_write(p.c, y * p.width + x, 0.0f);
-                    return;
-                }
-            }
-        }
-        float hxx = 0, hxy = 0, hyy = 0;
-        for (int k = -int(p.radius); k <= int(p.radius); ++k) {
-            int j = k + int(p.radius), source = (by + j) * p.width + x;
-            hxx = fma(st_read(p.b, 2 * p.stride + source), p.filter_g[j], hxx);
-            hxy = fma(st_read(p.b, p.stride + source), p.filter_d1[j], hxy);
-            hyy = fma(st_read(p.b, source), p.filter_d2[j], hyy);
-        }
-        hxy *= p.sigma_sq;
-        hyy *= p.sigma_sq;
-        float difference = fma(hxx, p.sigma_sq, -hyy);
-        float trace = fma(hxx, p.sigma_sq, hyy);
-        float disc = sqrt(max(fma(difference, difference, (4.0f * hxy) * hxy), 0.0f));
-        float a = abs(0.5f * (trace + disc)), b = abs(0.5f * (trace - disc));
-        float hi = max(a, b), lo = min(a, b), response = hi * (hi - lo) / (hi + lo + 1e-6f);
-        int index = y * p.width + x;
-        st_write(p.c, index, p.first_scale != 0 ? response : max(st_read(p.c, index), response));
-        return;
-    }
+    // Operations 0 and 1 (the band ridge passes of structure_gpu.hpp) are not used on Metal: structure_ridge below
+    // computes the whole map.
     if (operation == 2 || operation == 3 || operation == 6 || operation == 7) {
         float3 value = float3(0.0f, 0.0f, 0.0f);
         float valid_count = 0.0f;
@@ -291,4 +251,108 @@ kernel void structure_main(constant StructureParams& p [[buffer(0)]],
         st_write(p.g, n + index, st_read(p.g, n + index) + 0.7152f * value);
         st_write(p.g, 2 * n + index, st_read(p.g, 2 * n + index) + 0.0722f * value);
     }
+}
+
+// ---- Ridge map: the four scales in one tiled pass --------------------------------------------------------------
+// A 16x32 tile of output pixels loads its luma and mask keep flags, with a 10-pixel halo reflected at the image border,
+// into threadgroup memory once. Each scale then runs its separable Hessian from there: horizontal sums g, d1, d2 over
+// the tile rows and that scale's halo rows, then the vertical sums per output pixel, the same fma chains in the same
+// order as the band passes of structure_gpu.hpp, whose per-scale filters StructureRidgeParams packs back to back. A
+// pixel keeps the largest response of the scales whose window lies on kept pixels, 0 if even the smallest does not.
+// Threadgroup memory: 52x36 floats and bytes for the span, 3x52x16 floats for the horizontal sums: 19,344 bytes.
+constant constexpr int kRidgeTileWidth = 16;
+constant constexpr int kRidgeTileHeight = 32;
+constant constexpr int kRidgeHalo = 10; // the largest radius, sigma 2.5
+constant constexpr int kRidgeSpanWidth = kRidgeTileWidth + 2 * kRidgeHalo;
+constant constexpr int kRidgeSpanHeight = kRidgeTileHeight + 2 * kRidgeHalo;
+constant constexpr uint kRidgeThreads = kRidgeTileWidth * kRidgeTileHeight; // one thread per output pixel
+constant constexpr int kRidgeTaps = 7 + 11 + 15 + 21;
+
+struct StructureRidgeParams {
+    ulong image, mask, output;
+    int width, height;
+    uint image_byte, mask_byte, mask_mode, reserved;
+    float sigma_sq[4];
+    float filter_g[kRidgeTaps], filter_d1[kRidgeTaps], filter_d2[kRidgeTaps];
+};
+
+// One scale: Radius, and Offset of its filters in StructureRidgeParams.
+template <int Radius, int Offset>
+static void st_ridge_scale(constant StructureRidgeParams& p, const float sigma_sq, threadgroup const float* luma,
+                           threadgroup const uchar* keeps, threadgroup float* horizontal_g,
+                           threadgroup float* horizontal_d1, threadgroup float* horizontal_d2, const uint2 local,
+                           const uint rank, const bool inside, const bool masked, const bool first,
+                           thread float& best) {
+    constexpr int taps = 2 * Radius + 1;
+    constexpr int cells = (kRidgeTileHeight + 2 * Radius) * kRidgeTileWidth;
+    for (uint cell = rank; cell < uint(cells); cell += kRidgeThreads) {
+        const int start = (kRidgeHalo - Radius + int(cell) / kRidgeTileWidth) * kRidgeSpanWidth +
+                          int(cell) % kRidgeTileWidth + kRidgeHalo - Radius;
+        float g = 0, d1 = 0, d2 = 0;
+        bool valid = true;
+        for (int j = 0; j < taps; ++j) {
+            valid = valid && keeps[start + j] != 0;
+            const float v = luma[start + j];
+            g = fma(v, p.filter_g[Offset + j], g);
+            d1 = fma(v, p.filter_d1[Offset + j], d1);
+            d2 = fma(v, p.filter_d2[Offset + j], d2);
+        }
+        const float result = valid ? g : as_type<float>(0xff800000u);
+        horizontal_g[cell] = result;
+        horizontal_d1[cell] = valid ? d1 : result;
+        horizontal_d2[cell] = valid ? d2 : result;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (inside) {
+        const int column = int(local.y) * kRidgeTileWidth + int(local.x);
+        bool valid = true;
+        for (int j = 0; masked && j < taps; ++j)
+            valid = valid && !st_invalid_response(horizontal_g[column + j * kRidgeTileWidth]);
+        if (valid) {
+            float hxx = 0, hxy = 0, hyy = 0;
+            for (int j = 0; j < taps; ++j) {
+                const int cell = column + j * kRidgeTileWidth;
+                hxx = fma(horizontal_d2[cell], p.filter_g[Offset + j], hxx);
+                hxy = fma(horizontal_d1[cell], p.filter_d1[Offset + j], hxy);
+                hyy = fma(horizontal_g[cell], p.filter_d2[Offset + j], hyy);
+            }
+            const float response = st_ridge_response(hxx, hxy, hyy, sigma_sq);
+            best = first ? response : max(best, response);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void structure_ridge(constant StructureRidgeParams& p [[buffer(0)]],
+                            uint2 group [[threadgroup_position_in_grid]],
+                            uint2 local [[thread_position_in_threadgroup]],
+                            uint rank [[thread_index_in_threadgroup]]) {
+    threadgroup float luma[kRidgeSpanHeight * kRidgeSpanWidth];
+    threadgroup uchar keeps[kRidgeSpanHeight * kRidgeSpanWidth];
+    threadgroup float horizontal_g[kRidgeSpanHeight * kRidgeTileWidth];
+    threadgroup float horizontal_d1[kRidgeSpanHeight * kRidgeTileWidth];
+    threadgroup float horizontal_d2[kRidgeSpanHeight * kRidgeTileWidth];
+    const int x0 = int(group.x) * kRidgeTileWidth, y0 = int(group.y) * kRidgeTileHeight;
+    const int n = p.width * p.height;
+    for (uint cell = rank; cell < uint(kRidgeSpanHeight * kRidgeSpanWidth); cell += kRidgeThreads) {
+        const int row = st_reflect(y0 - kRidgeHalo + int(cell) / kRidgeSpanWidth, p.height);
+        const int column = st_reflect(x0 - kRidgeHalo + int(cell) % kRidgeSpanWidth, p.width);
+        const int source = row * p.width + column;
+        luma[cell] = st_luma_at(p.image, n, p.image_byte, source);
+        keeps[cell] = st_keeps_at(p.mask, p.mask_byte, p.mask_mode, source) ? 1 : 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int x = x0 + int(local.x), y = y0 + int(local.y);
+    const bool inside = x < p.width && y < p.height, masked = p.mask != 0;
+    float best = 0.0f;
+    st_ridge_scale<3, 0>(p, p.sigma_sq[0], luma, keeps, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
+                         inside, masked, true, best);
+    st_ridge_scale<5, 7>(p, p.sigma_sq[1], luma, keeps, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
+                         inside, masked, false, best);
+    st_ridge_scale<7, 18>(p, p.sigma_sq[2], luma, keeps, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
+                          inside, masked, false, best);
+    st_ridge_scale<10, 33>(p, p.sigma_sq[3], luma, keeps, horizontal_g, horizontal_d1, horizontal_d2, local, rank,
+                           inside, masked, false, best);
+    if (inside)
+        st_write(p.output, y * p.width + x, best);
 }
