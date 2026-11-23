@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1208,6 +1209,53 @@ namespace {
         EXPECT_EQ(cache.get(3, 8, ones, 8, 8, true), half_sum);
         cache.clear();
         EXPECT_EQ(cache.get(3, 8, ones, 8, 8, true), ones_sum) << "cleared";
+    }
+
+    // PhotoParams::loss_only, which the crop-box report sets: the loss keeps its bits, and on Metal the gradients,
+    // the maps and their workspace are left out and the next call reuses the small arena. A backend that ignores the
+    // flag computes the full evaluate, so the loss check holds there too.
+    TEST_P(PortableLosses, PhotometricLossOnlyKeepsTheLoss) {
+        const Shape4 fixture{1, 3, 32, 40};
+        const Shape4 odd{2, 3, 21, 27};
+        const std::array<std::pair<PhotoCase, const char*>, 7> cases{{
+            {{ops::PhotoPath::SSIM, fixture}, "ssim"},
+            {{ops::PhotoPath::Fused, odd, true}, "fused_batch_u8"},
+            {{ops::PhotoPath::Decoupled, fixture}, "decoupled"},
+            {{ops::PhotoPath::MaskedFused, odd, true, true}, "masked_fused_u8"},
+            {{ops::PhotoPath::MaskedDecoupled, fixture, false, true}, "masked_decoupled"},
+            {{ops::PhotoPath::MaskedDecoupled, fixture}, "masked_decoupled_soft"},
+            {{ops::PhotoPath::MaskedDecoupled, odd, true, true}, "masked_decoupled_batch_u8"},
+        }};
+        for (const auto& [pc, name] : cases) {
+            SCOPED_TRACE(name);
+            const PhotoInputs in = photo_inputs(pc, 11);
+            const bool decoupled = pc.path == ops::PhotoPath::Decoupled || pc.path == ops::PhotoPath::MaskedDecoupled;
+            const bool masked = pc.path == ops::PhotoPath::MaskedFused || pc.path == ops::PhotoPath::MaskedDecoupled;
+            const auto run = [&](ops::PhotoSaved& saved, const bool loss_only, Tensor& grad, Tensor& grad_raw) {
+                Tensor loss;
+                table_->photometric->evaluate(saved, in.x, decoupled ? in.raw : Tensor{}, in.y, masked ? in.mask : Tensor{},
+                                              {.path = pc.path, .ssim_weight = pc.weight, .valid_padding = true, .denominator = 0.f, .loss_only = loss_only},
+                                              loss, grad, grad_raw);
+                return std::bit_cast<uint32_t>(download(loss)[0]);
+            };
+            ops::PhotoSaved full{.backend = table_->photometric->create()};
+            ops::PhotoSaved only{.backend = table_->photometric->create()};
+            Tensor grad, grad_raw, no_grad, no_grad_raw;
+            const uint32_t expected = run(full, false, grad, grad_raw);
+            EXPECT_EQ(run(only, true, no_grad, no_grad_raw), expected);
+            if (GetParam() != GpuBackend::Metal)
+                continue;
+            EXPECT_FALSE(no_grad.is_valid());
+            EXPECT_FALSE(no_grad_raw.is_valid());
+            EXPECT_FALSE(only.ssim_map.is_valid());
+            EXPECT_FALSE(only.cs_map.is_valid());
+            // The partial sums and the result: a few KB whatever the image size.
+            const size_t allocated = table_->photometric->workspace_bytes(only).allocated;
+            EXPECT_LE(allocated, 2048 * sizeof(float) + 2 * 256);
+            EXPECT_LT(allocated, table_->photometric->workspace_bytes(full).allocated);
+            EXPECT_EQ(run(only, true, no_grad, no_grad_raw), expected);
+            EXPECT_EQ(table_->photometric->workspace_bytes(only).allocated, allocated);
+        }
     }
 
     INSTANTIATE_TEST_SUITE_P(Backends, PortableLosses, testing::Values(GpuBackend::Metal, GpuBackend::Vulkan),

@@ -46,7 +46,10 @@ namespace lfs::training {
                                     PureSSIM,
                                     Decoupled,
                                     MaskedFused,
-                                    MaskedDecoupled };
+                                    MaskedDecoupled,
+                                    // PhotoParams::loss_only: the forward's partial sums and the result.
+                                    LossOnly,
+                                    MaskedLossOnly };
         enum class Slot : uint8_t { Map,
                                     Full16,
                                     Full32,
@@ -75,6 +78,10 @@ namespace lfs::training {
                 return {{&V::ssim_map, Slot::Map}, {&V::dm_mu, Slot::Full16}, {&V::dm_sigma1, Slot::Full16}, {&V::dm_sigma12, Slot::Full16}, {&V::grad, Slot::Full32}, {&V::temp, Slot::Temp2048}, {&V::result, Slot::Scalar}, {&V::mask_sum, Slot::Scalar}};
             case Kind::MaskedDecoupled:
                 return {{&V::ssim_map, Slot::Map}, {&V::dm_mu, Slot::Full16}, {&V::raw_dm_mu, Slot::Full16}, {&V::dm_sigma1, Slot::Full16}, {&V::dm_sigma12, Slot::Full16}, {&V::grad, Slot::Full32}, {&V::temp, Slot::Temp2048}, {&V::result, Slot::Scalar}, {&V::mask_sum, Slot::Scalar}};
+            case Kind::LossOnly:
+                return {{&V::temp, Slot::Temp1024}, {&V::result, Slot::Scalar}};
+            case Kind::MaskedLossOnly:
+                return {{&V::temp, Slot::Temp2048}, {&V::result, Slot::Scalar}, {&V::mask_sum, Slot::Scalar}};
             case Kind::None:
                 return {};
             }
@@ -478,17 +485,25 @@ namespace lfs::training {
                               : params.path == PhotoPath::Decoupled ? Kind::Decoupled
                               : masked && decoupled                 ? Kind::MaskedDecoupled
                                                                     : Kind::MaskedFused;
-            Views& ws = state.arena.ensure(kind, dims(images.prediction));
-            ensure_like(state.cs_map, ws.ssim_map);
-            if (decoupled)
-                ensure_like(state.grad_raw, ws.grad);
-            else
-                state.grad_raw = {};
-
             const bool pure = kind == Kind::PureSSIM;
             const float weight = pure ? 1.0f : params.ssim_weight;
             const uint32_t mode = pure ? kLossSsimMean : masked ? kLossMasked
                                                                 : kLossFused;
+            // The loss alone: the same forward pipeline with no map or backward partial written, the same reduction,
+            // no backward passes, and an arena of the partial sums only.
+            Views& ws = state.arena.ensure(params.loss_only ? (masked ? Kind::MaskedLossOnly : Kind::LossOnly) : kind,
+                                           dims(images.prediction));
+            if (params.loss_only) {
+                state.cs_map = {};
+                state.grad_raw = {};
+            } else {
+                ensure_like(state.cs_map, ws.ssim_map);
+                if (decoupled)
+                    ensure_like(state.grad_raw, ws.grad);
+                else
+                    state.grad_raw = {};
+            }
+
             const uint32_t groups = ssim_forward(images,
                                                  {.ssim_map = ws.ssim_map,
                                                   .cs_map = state.cs_map,
@@ -504,6 +519,13 @@ namespace lfs::training {
                 reduce_final(ws.temp, groups, ws.result, -1.f, static_cast<float>(valid_count(images, padding)), 1.f);
             else
                 reduce_final(ws.temp, groups, ws.result, 1.f, static_cast<float>(valid_count(images, padding)), 0.f);
+            if (params.loss_only) {
+                loss = ws.result;
+                grad_corrected = {};
+                grad_raw = {};
+                publish_maps(saved, {}, {});
+                return;
+            }
 
             const Tensor mask_sum = masked ? ws.mask_sum : Tensor{};
             if (decoupled) {
