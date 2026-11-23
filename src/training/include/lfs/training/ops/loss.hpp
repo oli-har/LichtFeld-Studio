@@ -41,6 +41,19 @@ namespace lfs::gpu_ops {
         size_t error_map = 0;
     };
 
+    // Weights of the densification error map, in the order the trainer applies them; an empty tensor leaves its
+    // weight out. mask ([H,W] Float32, UInt8 or Bool) weights by its value as Float32, or with mask_keep_band by
+    // mask > mask_keep_min (1 or 0); roi by its H*W pixel weights; structure, the [H,W] thin-structure map, by
+    // 1 + structure_gain * clamp(structure, 0, 4).
+    struct ErrorMapWeights {
+        Tensor mask;
+        bool mask_keep_band = false;
+        float mask_keep_min = 0.f;
+        Tensor roi;
+        Tensor structure;
+        float structure_gain = 0.f;
+    };
+
     struct PhotometricOps {
         State (*create)();
 
@@ -71,6 +84,10 @@ namespace lfs::gpu_ops {
         // raw-render gradient of the last evaluate into grad_image after the appearance backward, then releases it;
         // an empty grad_image only releases it.
         void (*add_raw_gradient)(PhotoSaved&, Out grad_image) = nullptr;
+
+        // Null unless the backend has it: map_to_error of a [1,1,H,W] map and the weights' products in one pass,
+        // each product rounded as a separate multiply would round it. error may alias map.
+        void (*weighted_error_map)(In map, Out error, const ErrorMapWeights&) = nullptr;
     };
 
 } // namespace lfs::gpu_ops
