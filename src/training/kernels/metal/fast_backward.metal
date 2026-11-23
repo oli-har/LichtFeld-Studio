@@ -7,9 +7,15 @@
 // (means, rotation, scaling, opacity). Both keep the 256-primitive threadgroup
 // that owns one joint-bounds row.
 
-// Per-primitive gradient helper row: mean2d (0, 1), conic (2..4), opacity
-// (5), color (6..8; replaced by the SH mean gradient), depth (9).
-constant constexpr uint kFastGradStride = 12u;
+// Per-primitive row of the blend backward's sums: mean2d (0, 1), conic (2..4),
+// opacity (5), color (6..8; replaced by the SH mean gradient), depth (9); with
+// the normal channel also the normal (10..12), the densification weight and
+// error (13, 14) and the edge score (15), without it the densification weight
+// and error (10, 11), the edge score keeping its own buffer. One splat's sums
+// then share a 64- or 48-byte row; the geometry pass hands the densification
+// and edge sums to their buffers.
+static uint fast_grad_stride() { return kFastNormalChannel != 0u ? 16u : 12u; }
+static uint fast_densification_slot() { return kFastNormalChannel != 0u ? 13u : 10u; }
 constant constexpr float kFastGradClamp = 1e4f;
 
 static float fast_clamp_grad(const float g) { return fmin(fmax(g, -kFastGradClamp), kFastGradClamp); }
@@ -28,7 +34,6 @@ struct FastClearGradParams {
     device const uint* counts;
     device const uint* n_touched;
     device float4* grads;
-    device float4* normal_grads;
     uint n, capacity;
 };
 
@@ -36,11 +41,9 @@ kernel void fast_clear_visible_grads(constant FastClearGradParams& p [[buffer(0)
                                      const uint idx [[thread_position_in_grid]]) {
     if (!fast_valid_instance_count(p.counts, p.capacity) || idx >= p.n || p.n_touched[idx] == 0u)
         return;
-    p.grads[idx * 3u] = float4(0.0f);
-    p.grads[idx * 3u + 1u] = float4(0.0f);
-    p.grads[idx * 3u + 2u] = float4(0.0f);
-    if (kFastNormalChannel != 0u)
-        p.normal_grads[idx] = float4(0.0f);
+    const uint quads = fast_grad_stride() / 4u;
+    for (uint i = 0; i < quads; ++i)
+        p.grads[idx * quads + i] = float4(0.0f);
 }
 
 struct FastBlendBackwardParams {
@@ -61,8 +64,6 @@ struct FastBlendBackwardParams {
     device const uint* n_contrib;
     device const float* final_transmittance;
     device atomic_float* grads;
-    device atomic_float* normal_grads;
-    device atomic_float* densification;
     device const float* error_map;
     device const float* edge_weight;
     device atomic_float* edge_score;
@@ -349,20 +350,20 @@ kernel void fast_blend_backward(constant FastBlendBackwardParams& p [[buffer(0)]
                            a.normal.z, a.densification_weight, a.densification_error, a.edge};
             const float total = fast_transpose_sum16(v, lane);
             const uint component = (lane >> 1u) & 15u;
+            // One atomic per lane into the splat's row; the edge score has its own
+            // buffer when the row has no room for it.
+            const uint slot = component < 13u   ? component
+                              : component < 15u ? fast_densification_slot() + (component - 13u)
+                                                : 15u;
+            device atomic_float* const target = component < 15u || kFastNormalChannel != 0u
+                                                    ? p.grads + prim * fast_grad_stride() + slot
+                                                    : p.edge_score + prim;
+            const bool wanted = component < 10u || (component < 13u   ? kFastNormalChannel != 0u
+                                                    : component < 15u ? kFastDensification != 0u
+                                                                      : edge);
             // Zero totals leave the +0-initialized accumulators unchanged.
-            if ((lane & 1u) == 0u && total != 0.0f) {
-                if (component < 10u) {
-                    fast_atomic_add(p.grads + prim * kFastGradStride + component, fast_clamp_grad(total));
-                } else if (component < 13u) {
-                    if (kFastNormalChannel != 0u)
-                        fast_atomic_add(p.normal_grads + prim * 4u + (component - 10u), fast_clamp_grad(total));
-                } else if (component < 15u) {
-                    if (kFastDensification != 0u)
-                        fast_atomic_add(p.densification + (component - 13u) * p.n_primitives + prim, total);
-                } else if (edge) {
-                    fast_atomic_add(p.edge_score + prim, total);
-                }
-            }
+            if ((lane & 1u) == 0u && total != 0.0f && wanted)
+                fast_atomic_add(target, component < 13u ? fast_clamp_grad(total) : total);
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -879,7 +880,7 @@ kernel void fast_backward_sh(constant FastBackwardShParams& p [[buffer(0)]],
     float3 direction = float3(0.0f);
     float3 mean_grad = float3(0.0f);
     if (visible) {
-        device const float* g = p.grads + idx * kFastGradStride;
+        device const float* g = p.grads + idx * fast_grad_stride();
         grad_color = float3(g[6], g[7], g[8]);
         // The blend clamps colour at zero. Below it, keep only the image
         // gradients that brighten the splat; the forward never saw the rest.
@@ -982,7 +983,7 @@ kernel void fast_backward_sh(constant FastBackwardShParams& p [[buffer(0)]],
             atomic_fetch_add_explicit(p.sh_loss, total, memory_order_relaxed);
     }
     if (visible && part == 0u) {
-        device float* g = p.grads + idx * kFastGradStride;
+        device float* g = p.grads + idx * fast_grad_stride();
         g[6] = mean_grad.x;
         g[7] = mean_grad.y;
         g[8] = mean_grad.z;
@@ -999,7 +1000,6 @@ struct FastBackwardGeometryParams {
     device const float* camera;
     device const uint* n_touched;
     device const float* grads;
-    device const float4* normal_grads;
     device float* densification;
     device atomic_float* scale_loss;
     device atomic_float* opacity_loss;
@@ -1018,6 +1018,10 @@ struct FastBackwardGeometryParams {
     device const uchar* mean_far;
     float scale_normalizer, erank_weight, mean_median;
     uint per_splat_mean_step;
+    // The blend's densification weight and error ([2, n]) and edge scores, which
+    // the visible splats' rows add to.
+    device float* blend_densification;
+    device float* edge_score;
 };
 
 static float fast_sigmoid(const float x) { return 1.0f / (1.0f + exp(-x)); }
@@ -1124,7 +1128,7 @@ kernel void fast_backward_geometry(constant FastBackwardGeometryParams& p [[buff
         fast_flatten_reg_grads(p, idx * 3u, scale_grads);
         opacity_grads[0] = fast_opacity_extra_grad(p, idx);
     } else if (visible) {
-        device const float* g = p.grads + idx * kFastGradStride;
+        device const float* g = p.grads + idx * fast_grad_stride();
         const float3 mean3d = float3(p.means[idx]);
         const float4 w1 = p.view[0], w2 = p.view[1], w3 = p.view[2];
         const float depth = w3.x * mean3d.x + w3.y * mean3d.y + w3.z * mean3d.z + w3.w;
@@ -1226,8 +1230,8 @@ kernel void fast_backward_geometry(constant FastBackwardGeometryParams& p [[buff
         float3 dr0 = 2.0f * (rs0 * dcov3d.m11 + rs1 * dcov3d.m12 + rs2 * dcov3d.m13);
         float3 dr1 = 2.0f * (rs0 * dcov3d.m12 + rs1 * dcov3d.m22 + rs2 * dcov3d.m23);
         float3 dr2 = 2.0f * (rs0 * dcov3d.m13 + rs1 * dcov3d.m23 + rs2 * dcov3d.m33);
-        if (p.normal_grads != nullptr) {
-            const float3 gc = p.normal_grads[idx].xyz;
+        if (kFastNormalChannel != 0u) {
+            const float3 gc = float3(g[10], g[11], g[12]);
             const float3 gw = w1.xyz * gc.x + w2.xyz * gc.y + w3.xyz * gc.z;
             const float3 view_dir = mean3d - float3(p.camera[0], p.camera[1], p.camera[2]);
             const uint axis = (variance.x <= variance.y && variance.x <= variance.z) ? 0u
@@ -1263,6 +1267,12 @@ kernel void fast_backward_geometry(constant FastBackwardGeometryParams& p [[buff
             p.densification[idx] += 1.0f;
             p.densification[p.n + idx] += length(dmean2d * float2(0.5f * p.width, 0.5f * p.height));
         }
+        if (p.blend_densification != nullptr) {
+            p.blend_densification[idx] += g[fast_densification_slot()];
+            p.blend_densification[p.n + idx] += g[fast_densification_slot() + 1u];
+        }
+        if (kFastNormalChannel != 0u && p.edge_score != nullptr)
+            p.edge_score[idx] += g[15];
     }
 
     if (visible && p.rendered_count != nullptr)
