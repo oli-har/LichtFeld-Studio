@@ -12,6 +12,7 @@
 #include "core/tensor_execution.hpp"
 #include "core/tensor_serialization.hpp"
 #include "lfs/training/ops/registry.hpp"
+#include "ppisp.hpp"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -194,6 +195,14 @@ namespace lfs::training {
             return static_cast<size_t>(elements);
         }
 
+        // The slice parameters of a CHW image, for the slices of a PPISP forward.
+        [[nodiscard]] ops::GridSliceParams chw_slice(const BilateralGridParameterization parameterization) {
+            return {.layout = ops::Layout::CHW,
+                    .transform = parameterization == BilateralGridParameterization::ExposureChroma
+                                     ? ops::GridTransform::ExposureChroma
+                                     : ops::GridTransform::Affine};
+        }
+
         [[nodiscard]] ImageLayout validate_image_tensor(
             const lfs::core::Tensor& tensor,
             const std::string_view operation) {
@@ -309,6 +318,27 @@ namespace lfs::training {
         const auto grid = resident_grids_.slice(0, slot, slot + 1);
         assert(static_cast<int>(grids_.shape()[1]) == channels_);
         training_ops(lfs::core::default_gpu_backend()).bilateral->slice_forward(grid, rgb, shared_offset_, output, {.layout = layout.chw ? ops::Layout::CHW : ops::Layout::HWC, .transform = parameterization_ == BilateralGridParameterization::ExposureChroma ? ops::GridTransform::ExposureChroma : ops::GridTransform::Affine});
+    }
+
+    lfs::core::Tensor BilateralGrid::apply_after_ppisp(const lfs::core::Tensor& raw, const PPISPForwardParams& ppisp,
+                                                       const int image_idx) {
+        if (image_idx < 0 || image_idx >= num_images_) {
+            throw std::out_of_range("BilateralGrid::apply_after_ppisp: image_idx out of range");
+        }
+        const ImageLayout layout = validate_image_tensor(raw, "BilateralGrid::apply_after_ppisp");
+        if (!layout.chw)
+            throw std::invalid_argument("BilateralGrid::apply_after_ppisp: the raw image must be CHW");
+        const auto& ops = *training_ops(lfs::core::default_gpu_backend()).bilateral;
+        LFS_ASSERT(ops.slice_forward_ppisp != nullptr);
+        const auto rgb = raw.contiguous();
+        auto output = lfs::core::Tensor::empty(rgb.shape(), lfs::core::Device::GPU);
+        const int slot = resident_slot(image_idx);
+        const auto grid = resident_grids_.slice(0, slot, slot + 1);
+        ops.slice_forward_ppisp(grid, rgb, shared_offset_, {ppisp.exposure, ppisp.vignetting, ppisp.color, ppisp.crf},
+                                {0, layout.height, ppisp.cameras, ppisp.frames, ppisp.camera_index, ppisp.frame_index, 0,
+                                 layout.width},
+                                output, chw_slice(parameterization_));
+        return output;
     }
 
     lfs::core::Tensor BilateralGrid::backward(const lfs::core::Tensor& rgb,
