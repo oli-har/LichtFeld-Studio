@@ -36,6 +36,7 @@ namespace lfs::training {
             uint32_t prior;
             uint64_t rays;
             uint32_t wrap_horizontal;
+            uint64_t prior_normal, prior_finals, prior_blocks;
         };
 
         // The partials buffer: slot_count float finals, then the block statistics.
@@ -176,10 +177,59 @@ namespace lfs::training {
                          partials, intrinsics, weight, true);
         }
 
+        // prior_depth and consistency with one statistics and one gradient pass over the depth normal; each loss
+        // keeps its own finals and losses, finalized as the separate calls finalize them.
+        void prior_depth_and_consistency(In prior_normal, In normal, In depth, In alpha, In pixel_weight,
+                                         Out grad_normal, Out grad_depth, Out grad_alpha, Out prior_loss,
+                                         Out prior_partials, Out consistency_loss, Out consistency_partials,
+                                         GeometryCamera intrinsics, const float prior_weight,
+                                         const float consistency_weight) {
+            const int width = static_cast<int>(depth.shape()[1]), height = static_cast<int>(depth.shape()[0]);
+            const size_t pixels = static_cast<size_t>(width) * height;
+            const size_t required = k::normal_consistency_partial_count(pixels);
+            GeomParams prior = base_params(alpha, pixel_weight, prior_loss, prior_partials, width, height,
+                                           k::normal_consistency_slots::kSlotCount, required, "normal prior depth loss");
+            GeomParams params = base_params(alpha, pixel_weight, consistency_loss, consistency_partials, width, height,
+                                            k::normal_consistency_slots::kSlotCount, required, "normal consistency loss");
+            LFS_ASSERT_MSG(prior_partials.data_ptr() != consistency_partials.data_ptr(),
+                           "the prior depth and consistency losses need separate partials");
+            params.normal = mk::address(normal);
+            params.depth = mk::address(depth);
+            params.grad_normal = mk::address(grad_normal);
+            params.grad_depth = mk::address(grad_depth);
+            params.grad_alpha = mk::address(grad_alpha);
+            params.loss_weight = consistency_weight;
+            params.min_count = prior.min_count = k::kNormalConsistencyMinValidCount;
+            params.min_weight = prior.min_weight = k::kNormalConsistencyMinValidWeight;
+            set_intrinsics(params, intrinsics);
+            params.prior_normal = mk::address(prior_normal);
+            params.prior_finals = prior.finals;
+            params.prior_blocks = prior.blocks;
+            prior.loss_weight = prior_weight;
+            const auto run = [&](const std::string_view function, const GeomParams& launch, const uint32_t groups) {
+                mk::launch(function, launch,
+                           {&intrinsics.rays, &prior_normal, &normal, &depth, &alpha, &pixel_weight, &grad_normal,
+                            &grad_depth, &grad_alpha, &prior_loss, &prior_partials, &consistency_loss,
+                            &consistency_partials},
+                           groups, kThreads);
+            };
+            run("geom_depth_normal_pair_stats", params, params.num_blocks);
+            run("geom_normal_finalize_stats", prior, 1);
+            run("geom_normal_finalize_stats", params, 1);
+            run("geom_depth_normal_pair_grad", params, params.num_blocks);
+            run("geom_normal_finalize_loss", prior, 1);
+            run("geom_normal_finalize_loss", params, 1);
+        }
+
     } // namespace
 
     const lfs::gpu_ops::GeometryLossOps& metal_geometry_ops() {
-        static const lfs::gpu_ops::GeometryLossOps ops{depth, normal, consistency, prior_depth, collect_camera_anchor_samples};
+        static const lfs::gpu_ops::GeometryLossOps ops{.depth_impl = depth,
+                                                       .normal = normal,
+                                                       .consistency = consistency,
+                                                       .prior_depth = prior_depth,
+                                                       .collect_anchor_samples = collect_camera_anchor_samples,
+                                                       .prior_depth_and_consistency = prior_depth_and_consistency};
         return ops;
     }
 } // namespace lfs::training
