@@ -7779,6 +7779,9 @@ namespace lfs::training {
                             }
                         }
 
+                        // Set when the consistency loss below runs together with the prior depth loss, in one
+                        // backend call (GeometryLossOps::prior_depth_and_consistency): the prior normal.
+                        lfs::core::Tensor paired_prior_normal;
                         if ((run_fastgs_gaussian_backward || run_gut_gaussian_backward) &&
                             normal_supervision_started &&
                             step_params.normal_loss_weight > 0.0f &&
@@ -7924,12 +7927,20 @@ namespace lfs::training {
                                             const float cy = cam->center_y() * static_cast<float>(render_h) /
                                                              static_cast<float>(cam->camera_height());
 
-                                            lfs::core::pin_operands({&target_normal, &rendered_depth, &rendered_alpha, &gsplat_saved_.camera_rays});
-                                            training_ops_->geometry->prior_depth(
-                                                target_normal, rendered_depth, rendered_alpha, normal_pixel_weight,
-                                                depth_loss_grad_, depth_loss_grad_alpha_, normal_prior_depth_scalar_, normal_consistency_partials_,
-                                                {fx, fy, cx, cy, params_.optimization.gut ? gsplat_saved_.camera_rays : lfs::core::Tensor{}, params_.optimization.gut && gsplat_saved_.equirectangular}, step_params.normal_loss_weight);
-                                            tile_loss = tile_loss + normal_prior_depth_scalar_;
+                                            // The consistency block's checks then hold too: it makes the call, and an
+                                            // assert after it catches a prior-depth loss left behind.
+                                            if (training_ops_->geometry->prior_depth_and_consistency != nullptr &&
+                                                step_params.normal_consistency_weight > 0.0f &&
+                                                rendered_normal.ndim() == 3 && rendered_normal.shape()[0] == 3) {
+                                                paired_prior_normal = target_normal;
+                                            } else {
+                                                lfs::core::pin_operands({&target_normal, &rendered_depth, &rendered_alpha, &gsplat_saved_.camera_rays});
+                                                training_ops_->geometry->prior_depth(
+                                                    target_normal, rendered_depth, rendered_alpha, normal_pixel_weight,
+                                                    depth_loss_grad_, depth_loss_grad_alpha_, normal_prior_depth_scalar_, normal_consistency_partials_,
+                                                    {fx, fy, cx, cy, params_.optimization.gut ? gsplat_saved_.camera_rays : lfs::core::Tensor{}, params_.optimization.gut && gsplat_saved_.equirectangular}, step_params.normal_loss_weight);
+                                                tile_loss = tile_loss + normal_prior_depth_scalar_;
+                                            }
                                             if (step_params.normal_loss_weight > 0.0f)
                                                 strategy_->get_optimizer().skip_ray_depth_step();
                                         }
@@ -8034,14 +8045,35 @@ namespace lfs::training {
                                     {&rendered_normal, &rendered_depth, &rendered_alpha, &tile_grad_normal, &gsplat_saved_.camera_rays});
                                 const auto& consistency_pixel_weight =
                                     normal_weight_on_stream(consistency_stream);
-                                training_ops_->geometry->consistency(
-                                    rendered_normal, rendered_depth, rendered_alpha, consistency_pixel_weight,
-                                    tile_grad_normal, depth_loss_grad_, depth_loss_grad_alpha_, normal_consistency_scalar_, normal_consistency_partials_,
-                                    {fx, fy, cx, cy, params_.optimization.gut ? gsplat_saved_.camera_rays : lfs::core::Tensor{}, params_.optimization.gut && gsplat_saved_.equirectangular}, step_params.normal_consistency_weight);
+                                const lfs::gpu_ops::GeometryCamera consistency_camera{
+                                    fx, fy, cx, cy, params_.optimization.gut ? gsplat_saved_.camera_rays : lfs::core::Tensor{}, params_.optimization.gut && gsplat_saved_.equirectangular};
+                                if (paired_prior_normal.is_valid()) {
+                                    if (!normal_prior_depth_partials_.is_valid() ||
+                                        normal_prior_depth_partials_.shape()[0] != consistency_partials) {
+                                        normal_prior_depth_partials_ = lfs::core::Tensor::empty({consistency_partials}, lfs::core::Device::GPU);
+                                    }
+                                    normal_prior_depth_partials_.set_stream(consistency_stream);
+                                    paired_prior_normal.sync_to_stream(consistency_stream);
+                                    lfs::core::pin_operands({&paired_prior_normal});
+                                    training_ops_->geometry->prior_depth_and_consistency(
+                                        paired_prior_normal, rendered_normal, rendered_depth, rendered_alpha, consistency_pixel_weight,
+                                        tile_grad_normal, depth_loss_grad_, depth_loss_grad_alpha_, normal_prior_depth_scalar_,
+                                        normal_prior_depth_partials_, normal_consistency_scalar_, normal_consistency_partials_,
+                                        consistency_camera, step_params.normal_loss_weight, step_params.normal_consistency_weight);
+                                    tile_loss = tile_loss + normal_prior_depth_scalar_;
+                                    paired_prior_normal = {};
+                                } else {
+                                    training_ops_->geometry->consistency(
+                                        rendered_normal, rendered_depth, rendered_alpha, consistency_pixel_weight,
+                                        tile_grad_normal, depth_loss_grad_, depth_loss_grad_alpha_, normal_consistency_scalar_, normal_consistency_partials_,
+                                        consistency_camera, step_params.normal_consistency_weight);
+                                }
 
                                 tile_loss = tile_loss + normal_consistency_scalar_;
                             }
                         }
+                        LFS_ASSERT_MSG(!paired_prior_normal.is_valid(),
+                                       "the prior-depth loss was deferred to the consistency loss, which did not run");
 
                         merge_depth_grad_buffers();
 

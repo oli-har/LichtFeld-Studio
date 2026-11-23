@@ -38,6 +38,11 @@ struct GeomParams {
     uint prior; // depth-normal kernels: 0 consistency, 1 prior depth
     device const float* rays;
     uint wrap_horizontal;
+    // The pair kernels: the prior normal and the prior-depth loss's finals and block statistics, next to the
+    // consistency loss's in normal, finals and blocks.
+    device const float* prior_normal;
+    device float* prior_finals;
+    device float* prior_blocks;
 };
 
 constant constexpr int kGeomMaxStats = 3;
@@ -509,11 +514,16 @@ static void geom_atomic_add(device float* base, const uint i, const float value)
     atomic_fetch_add_explicit((device atomic_float*)(base + i), value, memory_order_relaxed);
 }
 
-// Scatters d(1 - cos)/d(depth, alpha) of a depth normal to its four neighbors.
-static void depth_normal_backward(constant GeomParams& p, thread const DepthNormal& s, const float3 target_hat,
-                                  const float cos, const float g_w, const int x, const int y) {
+// g_w * d(1 - cos)/d(n_raw) of a depth normal compared with target_hat.
+static float3 depth_normal_raw_grad(thread const DepthNormal& s, const float3 target_hat, const float cos,
+                                    const float g_w) {
     const float scale = -g_w * s.sign / s.nraw_norm;
-    const float3 g_raw = scale * (target_hat - cos * s.nd);
+    return scale * (target_hat - cos * s.nd);
+}
+
+// Scatters a gradient with respect to n_raw to the depth and alpha of the four neighbors.
+static void depth_normal_scatter(constant GeomParams& p, thread const DepthNormal& s, const float3 g_raw, const int x,
+                                 const int y) {
     // n_raw = tx x ty: grad_tx = ty x g_raw, grad_ty = g_raw x tx
     const float3 g_tx = float3(s.ty.y * g_raw.z - s.ty.z * g_raw.y, s.ty.z * g_raw.x - s.ty.x * g_raw.z,
                                s.ty.x * g_raw.y - s.ty.y * g_raw.x);
@@ -536,6 +546,12 @@ static void depth_normal_backward(constant GeomParams& p, thread const DepthNorm
     }
 }
 
+// Scatters d(1 - cos)/d(depth, alpha) of a depth normal to its four neighbors.
+static void depth_normal_backward(constant GeomParams& p, thread const DepthNormal& s, const float3 target_hat,
+                                  const float cos, const float g_w, const int x, const int y) {
+    depth_normal_scatter(p, s, depth_normal_raw_grad(s, target_hat, cos, g_w), x, y);
+}
+
 // The rendered normal at a pixel with a valid depth normal.
 static bool rendered_hat(constant GeomParams& p, const uint i, const uint pixels, thread float3& hat,
                          thread float& norm) {
@@ -549,8 +565,8 @@ static bool rendered_hat(constant GeomParams& p, const uint i, const uint pixels
     return true;
 }
 
-static bool prior_hat(constant GeomParams& p, const uint i, const uint pixels, thread float3& hat) {
-    const float3 n = float3(p.normal[i], p.normal[pixels + i], p.normal[2 * pixels + i]);
+static bool prior_hat(device const float* normal, const uint i, const uint pixels, thread float3& hat) {
+    const float3 n = float3(normal[i], normal[pixels + i], normal[2 * pixels + i]);
     if (!geom_finite(n.x) || !geom_finite(n.y) || !geom_finite(n.z))
         return false;
     const float norm = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
@@ -570,7 +586,7 @@ static bool depth_normal_sample(constant GeomParams& p, const uint i, const uint
     if (!s.active)
         return false;
     if (prior != 0) {
-        if (!prior_hat(p, i, pixels, hat))
+        if (!prior_hat(p.normal, i, pixels, hat))
             return false;
     } else if (!rendered_hat(p, i, pixels, hat, render_norm)) {
         return false;
@@ -624,6 +640,92 @@ kernel void geom_depth_normal_grad(constant GeomParams& p [[buffer(0)]],
         depth_normal_backward(p, s, hat, cos, g_w, int(i % W), int(i / W));
     }
     geom_store_block(p, sums, 1, GEOM_THREAD, scratch);
+}
+
+// The prior-depth (prior_normal, prior_finals, prior_blocks) and consistency losses in one pass each for the
+// statistics and the gradient: the depth normal of a pixel is built once, and the two losses' gradients with
+// respect to it are summed before they scatter to the depth and alpha of its neighbors.
+kernel void geom_depth_normal_pair_stats(constant GeomParams& p [[buffer(0)]], GEOM_THREAD_ARGS) {
+    threadgroup float scratch[32];
+    float sums[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const uint W = uint(p.width);
+    const uint pixels = W * uint(p.height);
+    for (uint i = group * width + rank; i < pixels; i += groups * width) {
+        const DepthNormal s = depth_normal(p, int(i % W), int(i / W));
+        if (!s.active)
+            continue;
+        const float aw = s.alpha * geom_pixel_weight(p, i);
+        if (aw == 0.0f)
+            continue;
+        float3 hat;
+        float render_norm = 0.0f;
+        if (prior_hat(p.prior_normal, i, pixels, hat)) {
+            const float cos = s.nd.x * hat.x + s.nd.y * hat.y + s.nd.z * hat.z;
+            sums[0] += aw;
+            sums[1] += 1.0f;
+            sums[2] += aw * cos;
+        }
+        if (rendered_hat(p, i, pixels, hat, render_norm)) {
+            const float cos = s.nd.x * hat.x + s.nd.y * hat.y + s.nd.z * hat.z;
+            sums[3] += aw;
+            sums[4] += 1.0f;
+            sums[5] += aw * cos;
+        }
+    }
+    const GeomThread t = GEOM_THREAD;
+    for (int k = 0; k < 6; ++k) {
+        const float total = loss_group_sum(sums[k], scratch, t.rank, t.simd_lane, t.simd_group, t.simd_groups);
+        if (rank == 0)
+            (k < 3 ? p.prior_blocks : p.blocks)[uint(k % 3) * p.num_blocks + group] = total;
+    }
+}
+
+kernel void geom_depth_normal_pair_grad(constant GeomParams& p [[buffer(0)]], GEOM_THREAD_ARGS) {
+    threadgroup float scratch[32];
+    float sums[2] = {0.0f, 0.0f};
+    const float prior_inv_norm = p.prior_finals[kNormalInvNorm], inv_norm = p.finals[kNormalInvNorm];
+    const uint W = uint(p.width);
+    const uint pixels = W * uint(p.height);
+    for (uint i = group * width + rank; i < pixels; i += groups * width) {
+        if (prior_inv_norm == 0.0f && inv_norm == 0.0f)
+            break;
+        const int x = int(i % W), y = int(i / W);
+        const DepthNormal s = depth_normal(p, x, y);
+        if (!s.active)
+            continue;
+        const float aw = s.alpha * geom_pixel_weight(p, i);
+        if (aw == 0.0f)
+            continue;
+        float3 hat, g_raw = float3(0.0f);
+        float render_norm = 0.0f;
+        bool scatter = false;
+        if (prior_inv_norm != 0.0f && prior_hat(p.prior_normal, i, pixels, hat)) {
+            const float cos = s.nd.x * hat.x + s.nd.y * hat.y + s.nd.z * hat.z;
+            sums[0] += aw * (1.0f - cos);
+            g_raw += depth_normal_raw_grad(s, hat, cos, prior_inv_norm * aw);
+            scatter = true;
+        }
+        if (inv_norm != 0.0f && rendered_hat(p, i, pixels, hat, render_norm)) {
+            const float cos = s.nd.x * hat.x + s.nd.y * hat.y + s.nd.z * hat.z;
+            sums[1] += aw * (1.0f - cos);
+            const float g_w = inv_norm * aw;
+            // d(1 - cos)/dn_render = -(n_d - cos * n_hat) / |n_render|
+            const float3 g = (-g_w / render_norm) * (s.nd - cos * hat);
+            p.grad_normal[i] += g.x;
+            p.grad_normal[pixels + i] += g.y;
+            p.grad_normal[2 * pixels + i] += g.z;
+            g_raw += depth_normal_raw_grad(s, hat, cos, g_w);
+            scatter = true;
+        }
+        if (scatter)
+            depth_normal_scatter(p, s, g_raw, x, y);
+    }
+    const GeomThread t = GEOM_THREAD;
+    for (int k = 0; k < 2; ++k) {
+        const float total = loss_group_sum(sums[k], scratch, t.rank, t.simd_lane, t.simd_group, t.simd_groups);
+        if (rank == 0)
+            (k == 0 ? p.prior_blocks : p.blocks)[group] = total;
+    }
 }
 
 // ---- Anchor samples ---------------------------------------------------------

@@ -1028,6 +1028,8 @@ namespace lfs::training {
         core::Tensor normal_consistency_scalar_;
         core::Tensor normal_consistency_partials_;
         core::Tensor normal_prior_depth_scalar_;
+        // The prior depth loss's partials when it runs together with the consistency loss.
+        core::Tensor normal_prior_depth_partials_;
         core::Tensor roi_weight_map_;
         // The reported loss measures the image inside the crop box: its weight map (outside 0)
         // and the forward-only L1/D-SSIM over it, on loss readback iterations.

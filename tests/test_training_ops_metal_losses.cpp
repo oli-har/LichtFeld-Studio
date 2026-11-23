@@ -1019,12 +1019,23 @@ namespace {
 
     // Consistency (prior=false) and prior depth (prior=true), added onto the
     // given starting gradients.
+    // rays: optional [H,W,3] camera rays in place of the pinhole; wrap: the image wraps around horizontally (a
+    // panorama), so the edge columns are each other's neighbours.
     NormalRef depth_normal_reference(const GeomInputs& in, const bool prior, const bool weighted, const ops::Intrinsics& kk,
-                                     const double weight, const Field& g_normal0, const Field& g_depth0, const Field& g_alpha0) {
+                                     const double weight, const Field& g_normal0, const Field& g_depth0, const Field& g_alpha0,
+                                     const std::vector<float>& rays = {}, const bool wrap = false) {
         const int W = in.w, H = in.h;
         const size_t n = static_cast<size_t>(W) * H;
         const auto ray = [&](const int x, const int y) {
+            if (!rays.empty()) {
+                const size_t j = 3 * (static_cast<size_t>(y) * W + (wrap ? (x + W) % W : x));
+                return Vec3{rays[j], rays[j + 1], rays[j + 2]};
+            }
             return Vec3{(x + 0.5 - kk.cx) / kk.fx, (y + 0.5 - kk.cy) / kk.fy, 1.0};
+        };
+        const auto neighbours = [&](const int x, const int y) {
+            const size_t row = static_cast<size_t>(y) * W;
+            return std::array<size_t, 4>{row + (x + 1) % W, row + (x + W - 1) % W, row + W + x, row - W + x};
         };
         const auto expected = [&](const size_t i, double& e, double& a) {
             a = in.alpha[i];
@@ -1041,13 +1052,13 @@ namespace {
         };
         const auto sample = [&](const int x, const int y) {
             S s;
-            if (x <= 0 || y <= 0 || x >= W - 1 || y >= H - 1)
+            if ((!wrap && (x <= 0 || x >= W - 1)) || y <= 0 || y >= H - 1)
                 return s;
             const size_t i = static_cast<size_t>(y) * W + x;
             double ec, ac;
             if (!expected(i, ec, ac))
                 return s;
-            const size_t nb[4] = {i + 1, i - 1, i + W, i - W};
+            const auto nb = neighbours(x, y);
             for (int q = 0; q < 4; ++q)
                 if (!expected(nb[q], s.e[q], s.a[q]) || std::abs(s.e[q] - ec) > k::kNormalConsistencyMaxRelDepthJump * ec)
                     return s;
@@ -1104,7 +1115,7 @@ namespace {
                 const Vec3 g_tx = cross(s.ty, g_raw), g_ty = cross(g_raw, s.tx);
                 const double g_e[4] = {dot(g_tx, ray(x + 1, y)), -dot(g_tx, ray(x - 1, y)), dot(g_ty, ray(x, y + 1)),
                                        -dot(g_ty, ray(x, y - 1))};
-                const size_t nb[4] = {i + 1, i - 1, i + W, i - W};
+                const auto nb = neighbours(x, y);
                 for (int q = 0; q < 4; ++q) {
                     ref.grad_depth[nb[q]] += g_e[q] / s.a[q];
                     ref.grad_alpha[nb[q]] += -g_e[q] * s.e[q] / s.a[q];
@@ -1155,6 +1166,72 @@ namespace {
                 expect_field(download(gd), ref.grad_depth, 1e-12, 1e-4, ptag + " grad_depth");
                 expect_field(download(ga), ref.grad_alpha, 1e-12, 1e-4, ptag + " grad_alpha");
             }
+        }
+    }
+
+    // GeometryLossOps::prior_depth_and_consistency against the references of the two losses one after the other,
+    // which the separate calls compute: each loss's finals and value, and the gradients of both. Pinhole cameras with
+    // and without pixel weights, and a wrapping panorama with per-pixel rays.
+    TEST_P(PortableLosses, PriorDepthAndConsistencyMatchReference) {
+        if (table_->geometry->prior_depth_and_consistency == nullptr)
+            GTEST_SKIP() << "No prior_depth_and_consistency on " << lfs::core::gpu_backend_name(GetParam());
+        const ops::Intrinsics kk{45.f, 43.f, 19.5f, 14.f};
+        for (const int c : {0, 1, 2}) {
+            const bool weighted = c != 1, panorama = c == 2;
+            const std::string tag = std::format("weighted={} panorama={}", weighted, panorama);
+            GeomInputs in = geom_inputs(38, 29, true);
+            const int W = in.w, H = in.h;
+            const size_t n = static_cast<size_t>(W) * H;
+            std::vector<float> rays;
+            if (panorama) {
+                // Depth periodic across the seam, so the edge columns keep their depth normals.
+                rays.resize(3 * n);
+                const auto jitter = uniform(n, 43, -1.f, 1.f);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const size_t i = static_cast<size_t>(y) * W + x;
+                        const float e = 2.f + 0.3f * std::sin(6.2831853f * static_cast<float>(x) / W) +
+                                        0.2f * std::cos(y / 5.f) + 0.01f * jitter[i];
+                        in.depth[i] = e * in.alpha[i];
+                        const float longitude = 6.2831853f * (x + 0.5f) / W - 3.1415927f;
+                        const float latitude = 3.1415927f * (y + 0.5f) / H - 1.5707964f;
+                        rays[3 * i] = std::cos(latitude) * std::sin(longitude);
+                        rays[3 * i + 1] = std::sin(latitude);
+                        rays[3 * i + 2] = std::cos(latitude) * std::cos(longitude);
+                    }
+            }
+            const TensorShape plane({static_cast<size_t>(H), static_cast<size_t>(W)});
+            const TensorShape planes({3, static_cast<size_t>(H), static_cast<size_t>(W)});
+            const ops::GeometryCamera camera =
+                panorama ? ops::GeometryCamera{kk.fx, kk.fy, kk.cx, kk.cy,
+                                               upload(rays, TensorShape({static_cast<size_t>(H), static_cast<size_t>(W), 3})),
+                                               true}
+                         : ops::GeometryCamera{kk};
+            const auto g_normal0 = uniform(3 * n, 40, -0.01f, 0.01f), g_depth0 = uniform(n, 41, -0.01f, 0.01f);
+            const auto g_alpha0 = uniform(n, 42, -0.01f, 0.01f);
+            Tensor gn = upload(g_normal0, planes), gd = upload(g_depth0, plane), ga = upload(g_alpha0, plane);
+            Tensor prior_loss = Tensor::zeros({1}, Device::GPU), consistency_loss = Tensor::zeros({1}, Device::GPU);
+            Tensor prior_partials = Tensor::zeros({k::normal_consistency_partial_count(n)}, Device::GPU);
+            Tensor consistency_partials = Tensor::zeros({k::normal_consistency_partial_count(n)}, Device::GPU);
+            table_->geometry->prior_depth_and_consistency(upload(in.prior, planes), upload(in.normal, planes),
+                                                          upload(in.depth, plane), upload(in.alpha, plane),
+                                                          weighted ? upload(in.weight, plane) : Tensor{}, gn, gd, ga,
+                                                          prior_loss, prior_partials, consistency_loss,
+                                                          consistency_partials, camera, 0.5f, 0.25f);
+            const NormalRef prior = depth_normal_reference(in, true, weighted, kk, 0.5, widen(g_normal0), widen(g_depth0),
+                                                           widen(g_alpha0), rays, panorama);
+            const NormalRef both = depth_normal_reference(in, false, weighted, kk, 0.25, prior.grad_normal,
+                                                          prior.grad_depth, prior.grad_alpha, rays, panorama);
+            EXPECT_GT(prior.finals[0], 0.5) << tag << " fixture must be valid";
+            EXPECT_GT(both.finals[0], 0.5) << tag << " fixture must be valid";
+            expect_finals(download(prior_partials), prior.finals.data(), prior.finals.size(), "prior finals " + tag);
+            expect_finals(download(consistency_partials), both.finals.data(), both.finals.size(),
+                          "consistency finals " + tag);
+            expect_value(download(prior_loss)[0], prior.loss, 2e-5, "prior loss " + tag);
+            expect_value(download(consistency_loss)[0], both.loss, 2e-5, "consistency loss " + tag);
+            expect_field(download(gn), both.grad_normal, 1e-12, 1e-4, "grad_normal " + tag);
+            expect_field(download(gd), both.grad_depth, 1e-12, 1e-4, "grad_depth " + tag);
+            expect_field(download(ga), both.grad_alpha, 1e-12, 1e-4, "grad_alpha " + tag);
         }
     }
 
