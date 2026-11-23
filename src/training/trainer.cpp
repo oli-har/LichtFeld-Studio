@@ -7446,7 +7446,16 @@ namespace lfs::training {
                             else
                                 corrected_image.clamp_(0.0f, 1.0f);
                         };
-                        if (exposure_correction) {
+                        if (exposure_correction && ppisp_on && grid_active_this_iter &&
+                            training_ops_->bilateral->slice_forward_ppisp != nullptr) {
+                            lfs::core::push_gpu_range("bilateral_grid_forward");
+                            LFS_VRAM_SCOPE("train.bilateral_grid.forward");
+                            LOG_VRAM_DIFF("train.bilateral_grid.forward");
+                            // PPISP, the grid and the clamp in one pass, without the PPISP image between them.
+                            corrected_image = bilateral_grid_->apply_after_ppisp(
+                                output.image, ppisp_->forward_params(cam->camera_id(), cam->uid()), cam->uid());
+                            lfs::core::pop_gpu_range();
+                        } else if (exposure_correction) {
                             if (ppisp_on) {
                                 lfs::core::push_gpu_range("ppisp_forward");
                                 LFS_VRAM_SCOPE("train.ppisp.forward");

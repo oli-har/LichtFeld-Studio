@@ -13,6 +13,8 @@
 
 namespace lfs::training {
 
+    struct PPISPForwardParams;
+
     enum class BilateralGridParameterization {
         Affine = 0,
         ExposureChroma = 1,
@@ -54,6 +56,9 @@ namespace lfs::training {
         lfs::core::Tensor apply(const lfs::core::Tensor& rgb, int image_idx);
         /// Forward pass that overwrites the contiguous rgb with its corrected colors.
         void apply_in_place(lfs::core::Tensor& rgb, int image_idx);
+        /// apply() of the PPISP forward of the CHW raw image, clamped to [0, 1], in one pass; needs the backend's
+        /// BilateralOps::slice_forward_ppisp.
+        lfs::core::Tensor apply_after_ppisp(const lfs::core::Tensor& raw, const PPISPForwardParams& ppisp, int image_idx);
 
         /// Backward pass: accumulate gradients (call optimizer_step after all backward calls)
         lfs::core::Tensor backward(const lfs::core::Tensor& rgb,

@@ -70,6 +70,13 @@ namespace lfs::training {
     /// A zero full extent uses the input extent on that axis.
     using PPISPRegion = lfs::core::PpispRegion;
 
+    /// What PPISP::apply(rgb, camera_id, uid) hands the backend's PPISP forward, for ops that run that forward inside
+    /// another pass (BilateralGrid::apply_after_ppisp).
+    struct PPISPForwardParams {
+        const lfs::core::Tensor &exposure, &vignetting, &color, &crf;
+        int cameras = 0, frames = 0, camera_index = -1, frame_index = -1;
+    };
+
     /// Physically-Plausible Image Signal Processing for per-camera/per-frame appearance modeling
     class PPISP {
     public:
@@ -125,6 +132,8 @@ namespace lfs::training {
         /// @param uid Original frame UID (translated internally)
         lfs::core::Tensor apply(const lfs::core::Tensor& rgb, int camera_id, int uid,
                                 const PPISPRegion& region = {});
+        /// The parameters apply(rgb, camera_id, uid) passes to the backend's forward.
+        [[nodiscard]] PPISPForwardParams forward_params(int camera_id, int uid) const;
 
         lfs::core::Tensor apply_interpolated_frames(const lfs::core::Tensor& rgb, int camera_id,
                                                     int left_uid, int right_uid, float fraction);

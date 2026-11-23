@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
+#include "lfs/training/ops/ppisp.hpp"
 #include "lfs/training/ops/types.hpp"
 
 namespace lfs::gpu_ops {
@@ -35,5 +36,9 @@ namespace lfs::gpu_ops {
         void (*download_slice)(Out host, Out device, size_t host_offset, size_t device_offset, size_t elements);
         // slice_forward may write output over rgb, and slice_backward grad_rgb over grad_output.
         bool in_place = false;
+        // Null unless the backend has it: slice_forward of the PPISP forward of a CHW raw image (PPISPOps::forward
+        // with these inputs and region), clamped to [0, 1], in one pass.
+        void (*slice_forward_ppisp)(In grid, In raw, In shared_offset, const PPISPInputs& ppisp, const PPISPRegion& region,
+                                    Out output, const GridSliceParams&) = nullptr;
     };
 } // namespace lfs::gpu_ops

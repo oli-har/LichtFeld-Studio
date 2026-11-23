@@ -9,6 +9,11 @@ constant constexpr float kC2G_r = 0.299f;
 constant constexpr float kC2G_g = 0.587f;
 constant constexpr float kC2G_b = 0.114f;
 
+// Set: the slice's rgb is PPISP's forward of the raw render in ppisp.rgb_in (CHW), computed per pixel, and the
+// forward clamps its output to [0, 1], as the trainer's exposure correction does after the grid.
+constant uint kBilateralPpispInput [[function_constant(80)]];
+constant bool kBilateralPpisp = is_function_constant_defined(kBilateralPpispInput) && kBilateralPpispInput != 0;
+
 struct BilateralSliceParams {
     device const float* grid;
     device const float* rgb;
@@ -19,6 +24,7 @@ struct BilateralSliceParams {
     int L, H, W, h, w;
     uint chw;
     uint exposure_chroma;
+    PpispForwardParams ppisp; // with kBilateralPpisp
 };
 
 // Trilinear cell of one pixel and its guidance.
@@ -88,6 +94,17 @@ static float3 bilateral_finite_or(const float3 v, const float fallback) {
                   ppisp_isfinite(v.z) ? v.z : fallback);
 }
 
+// The slice's rgb at pixel: the image, or with kBilateralPpisp PPISP's forward of the raw render.
+static float3 bilateral_input(constant BilateralSliceParams& p, const int pixel) {
+    return kBilateralPpisp ? ppisp_forward_pixel(p.ppisp, pixel) : bilateral_load(p, p.rgb, pixel);
+}
+
+// clamp_values's [0, 1] clamp of finite values, in its safe math.
+static float3 bilateral_clamp(const float3 v) {
+#pragma METAL fp math_mode(safe)
+    return float3(min(max(v.x, 0.0f), 1.0f), min(max(v.y, 0.0f), 1.0f), min(max(v.z, 0.0f), 1.0f));
+}
+
 static PpispColor bilateral_color(thread const float* sampled) {
     return {float2(sampled[1], sampled[2]), float2(sampled[3], sampled[4]), float2(sampled[5], sampled[6]),
             float2(sampled[7], sampled[8])};
@@ -115,7 +132,7 @@ kernel void bilateral_slice_forward(constant BilateralSliceParams& p [[buffer(0)
     const int pixel = int(index);
     if (pixel >= p.h * p.w)
         return;
-    const float3 rgb = bilateral_finite_or(bilateral_load(p, p.rgb, pixel), 0.5f);
+    const float3 rgb = bilateral_finite_or(bilateral_input(p, pixel), 0.5f);
     const BilateralCell c = bilateral_cell(p, pixel % p.w, pixel / p.w, rgb);
     float3 out = 0.0f;
     if (p.exposure_chroma != 0) {
@@ -127,7 +144,8 @@ kernel void bilateral_slice_forward(constant BilateralSliceParams& p [[buffer(0)
         for (int ci = 0; ci < 12; ++ci)
             out[ci / 4] += bilateral_sample(p, c, ci) * bilateral_coefficient(rgb, ci);
     }
-    bilateral_store(p, p.output, pixel, bilateral_finite_or(out, 0.5f));
+    out = bilateral_finite_or(out, 0.5f);
+    bilateral_store(p, p.output, pixel, kBilateralPpisp ? bilateral_clamp(out) : out);
 }
 
 kernel void bilateral_slice_backward_rgb(constant BilateralSliceParams& p [[buffer(0)]],

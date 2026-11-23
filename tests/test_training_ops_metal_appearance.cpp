@@ -713,6 +713,54 @@ namespace {
         expect_close(host(gk), group(&PpispParams::crf), 2e-4, 2e-3, "ppisp crf gradient");
     }
 
+    // A grid of each transform over a CHW image, its PPISP parameters and the ones its PPISP forward uses.
+    struct PpispGridCase {
+        Tensor exposure, vignetting, color, crf, raw, grid, offset;
+        ops::GridSliceParams slice;
+    };
+
+    PpispGridCase ppisp_grid_case(const bool exposure_chroma, const int h, const int w) {
+        const PpispParams p = ppisp_values();
+        const int channels = exposure_chroma ? 9 : 12;
+        const size_t cells = static_cast<size_t>(channels) * 4 * 3 * 5;
+        return {gpu(narrow(p.exposure), {3}),
+                gpu(narrow(p.vignetting), {30}),
+                gpu(narrow(p.color), {24}),
+                gpu(narrow(p.crf), {24}),
+                gpu(pattern(3 * h * w, 0.6f, 7, 0.45f), {3, static_cast<size_t>(h), static_cast<size_t>(w)}),
+                gpu(pattern(cells, exposure_chroma ? 0.3f : 0.6f, 3, exposure_chroma ? 0.f : 0.2f),
+                    {1, static_cast<size_t>(channels), 4, 3, 5}),
+                gpu(pattern(channels, 0.1f, 17), {static_cast<size_t>(channels)}),
+                {ops::Layout::CHW, exposure_chroma ? ops::GridTransform::ExposureChroma : ops::GridTransform::Affine,
+                 true}};
+    }
+
+    // BilateralOps::slice_forward_ppisp against PPISP's forward, slice_forward and the clamp as separate passes, within
+    // float rounding: fast math compiles the same per-pixel functions differently in one kernel.
+    TEST_P(PortableAppearance, BilateralSliceAfterPpispMatchesTheSequence) {
+        const auto& ops = table();
+        if (ops.bilateral->slice_forward_ppisp == nullptr)
+            GTEST_SKIP() << "No slice_forward_ppisp on " << lfs::core::gpu_backend_name(GetParam());
+        constexpr int H = 37, W = 53;
+        for (const bool exposure_chroma : {true, false}) {
+            const PpispGridCase c = ppisp_grid_case(exposure_chroma, H, W);
+            for (const auto [camera, frame] : {std::pair{1, 2}, std::pair{-1, 0}, std::pair{0, -1}}) {
+                const std::string what = std::format("{} camera={} frame={}", exposure_chroma ? "exposure-chroma" : "affine",
+                                                     camera, frame);
+                const ops::PPISPRegion region{0, H, 2, 3, camera, frame, 0, W};
+                auto corrected = Tensor::empty({3, H, W}, Device::GPU);
+                ops.ppisp->forward({c.exposure, c.vignetting, c.color, c.crf}, c.raw, corrected, region);
+                auto sequence = Tensor::empty({3, H, W}, Device::GPU);
+                ops.bilateral->slice_forward(c.grid, corrected, c.offset, sequence, c.slice);
+                sequence.clamp_(0.0f, 1.0f);
+                auto fused = Tensor::empty({3, H, W}, Device::GPU);
+                ops.bilateral->slice_forward_ppisp(c.grid, c.raw, c.offset, {c.exposure, c.vignetting, c.color, c.crf},
+                                                   region, fused, c.slice);
+                expect_close(host(fused), widen(host(sequence)), 1e-6, 1e-5, what);
+            }
+        }
+    }
+
     TEST_P(PortableAppearance, PpispOptimizerAndRegularizers) {
         const auto& table = *this->table().ppisp;
         {

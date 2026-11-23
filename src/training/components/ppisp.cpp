@@ -388,6 +388,12 @@ namespace lfs::training {
                              num_frames_, region);
     }
 
+    PPISPForwardParams PPISP::forward_params(const int camera_id, const int uid) const {
+        assert(finalized_ && "Must call finalize() before forward_params()");
+        return {exposure_params_, vignetting_params_, color_params_, crf_params_,
+                num_cameras_, num_frames_, translate_camera(camera_id), translate_frame(uid)};
+    }
+
     lfs::core::Tensor PPISP::apply_interpolated_frames(const lfs::core::Tensor& rgb, int camera_id,
                                                        int left_uid, int right_uid, float fraction) {
         assert(finalized_ && fraction >= 0.0f && fraction <= 1.0f);

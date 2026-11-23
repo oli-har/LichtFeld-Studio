@@ -7,6 +7,7 @@
 #include "metal_kernels.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <format>
 #include <stdexcept>
 
@@ -18,16 +19,29 @@ namespace lfs::training {
         using lfs::gpu_ops::In;
         using lfs::gpu_ops::Layout;
         using lfs::gpu_ops::Out;
+        using lfs::gpu_ops::PPISPInputs;
+        using lfs::gpu_ops::PPISPRegion;
         namespace mk = metal;
 
         constexpr uint32_t kTile = 32;
         constexpr uint32_t kTileThreads = 16;
 
+        // ppisp.metal's PpispForwardParams, which the slice kernels read with kBilateralPpispInput.
+        struct PpispParams {
+            uint64_t exposure, vignetting, color, crf, rgb_in, rgb_out;
+            int32_t height, width, y_offset, full_height, camera_index, frame_index, x_offset, full_width;
+        };
+
         struct SliceParams {
             uint64_t grid, rgb, grad_output, offset, output, grad_grid;
             int32_t L, H, W, h, w;
             uint32_t chw, exposure_chroma;
+            PpispParams ppisp;
         };
+        static_assert(offsetof(SliceParams, ppisp) == 80 && sizeof(SliceParams) == 160);
+
+        // Function constant kBilateralPpispInput of the slice kernels.
+        constexpr uint32_t kPpispInputConstant = 80;
 
         SliceParams slice_params(In grid, In rgb, In shared_offset, const GridSliceParams& params) {
             const auto& shape = grid.shape();
@@ -55,6 +69,44 @@ namespace lfs::training {
             p.output = mk::address(output);
             mk::launch_items("bilateral_slice_forward", p, {&grid, &rgb, &shared_offset, &output},
                              static_cast<size_t>(p.h) * static_cast<size_t>(p.w));
+        }
+
+        // The slice of PPISP's forward of the CHW raw image: the kernels compute it per pixel.
+        SliceParams ppisp_slice_params(In grid, In raw, In shared_offset, const PPISPInputs& ppisp,
+                                       const PPISPRegion& region, const GridSliceParams& params) {
+            if (params.layout != Layout::CHW)
+                throw std::invalid_argument("bilateral slice of a PPISP forward needs a CHW image");
+            auto p = slice_params(grid, raw, shared_offset, params);
+            const int full_width = region.full_width > 0 ? region.full_width : p.w;
+            if (region.x_offset < 0 || region.x_offset + p.w > full_width || region.y_offset < 0 ||
+                region.y_offset + p.h > region.full_height)
+                throw std::invalid_argument(std::format("PPISP region of {}x{} at ({}, {}) exceeds {}x{}", p.w, p.h,
+                                                        region.x_offset, region.y_offset, full_width,
+                                                        region.full_height));
+            p.ppisp = {.exposure = mk::address(ppisp.exposure),
+                       .vignetting = mk::address(ppisp.vignetting),
+                       .color = mk::address(ppisp.color),
+                       .crf = mk::address(ppisp.crf),
+                       .rgb_in = mk::address(raw),
+                       .height = p.h,
+                       .width = p.w,
+                       .y_offset = region.y_offset,
+                       .full_height = region.full_height,
+                       .camera_index = region.camera_index,
+                       .frame_index = region.frame_index,
+                       .x_offset = region.x_offset,
+                       .full_width = full_width};
+            return p;
+        }
+
+        void slice_forward_ppisp(In grid, In raw, In shared_offset, const PPISPInputs& ppisp, const PPISPRegion& region,
+                                 Out output, const GridSliceParams& params) {
+            auto p = ppisp_slice_params(grid, raw, shared_offset, ppisp, region, params);
+            p.output = mk::address(output);
+            mk::launch_items("bilateral_slice_forward", p,
+                             {&grid, &raw, &shared_offset, &ppisp.exposure, &ppisp.vignetting, &ppisp.color, &ppisp.crf,
+                              &output},
+                             static_cast<size_t>(p.h) * static_cast<size_t>(p.w), {{kPpispInputConstant, 1u}});
         }
 
         // grad_grid accumulates, as the CUDA atomics do.
@@ -192,6 +244,7 @@ namespace lfs::training {
             .scale_moments = scale_moments,
             .upload_slice = upload_slice,
             .download_slice = download_slice,
+            .slice_forward_ppisp = slice_forward_ppisp,
         };
         return ops;
     }
