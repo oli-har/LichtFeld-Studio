@@ -1601,6 +1601,7 @@ namespace lfs::training {
             .ssim_weight = params.lambda_dssim,
             .valid_padding = true,
             .denominator = denominator,
+            .loss_only = true,
         };
         core::Tensor loss, grad_corrected, grad_raw;
         photometric.evaluate(roi_report_photo_, corrected, decoupled ? raw : core::Tensor{}, target, weight,

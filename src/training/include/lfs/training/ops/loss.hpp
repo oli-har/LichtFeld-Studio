@@ -23,6 +23,9 @@ namespace lfs::gpu_ops {
         float ssim_weight = 0.f;
         bool valid_padding = true;
         float denominator = 0.f;
+        // The caller needs only the loss: evaluate may leave the gradients, the maps and their workspace out (and
+        // the gradient outputs empty); a backend that ignores it computes them as before.
+        bool loss_only = false;
     };
 
     struct PhotoSaved {
