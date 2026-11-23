@@ -390,6 +390,109 @@ namespace {
         check_bilateral_slice(true, true);
     }
 
+    // The grid gradient of one image against the per-pixel contributions summed in double. blown_out sets a block of
+    // pixels to colors whose guidance clamps to exactly 1.0, so their cells' two levels coincide (z1 == z0 == L - 1),
+    // as in blown-out areas of real images.
+    void check_grid_gradient(const int h, const int w, const int H, const int W, const int L, const bool exposure_chroma,
+                             const bool blown_out) {
+        const auto& table = *lfs::training::training_ops(backend_under_test()).bilateral;
+        const int pixels = h * w;
+        const std::string what = std::format("bilateral grid gradient {}x{} image, {}x{}x{} {} grid{}", h, w, W, H, L,
+                                             exposure_chroma ? "exposure-chroma" : "affine", blown_out ? ", blown out" : "");
+        const int channels = exposure_chroma ? 9 : 12;
+        const size_t cells = static_cast<size_t>(channels) * L * H * W;
+        Grid grid{channels, L, H, W, {}};
+        const auto grid_values = pattern(cells, exposure_chroma ? 0.3f : 0.6f, 3, exposure_chroma ? 0.f : 0.2f);
+        grid.values = widen(grid_values);
+        const auto offset_values = pattern(channels, 0.1f, 17);
+        const Doubles offset = widen(offset_values);
+        // Colors whose guidance keeps clear of the grid's level planes, where float and double could pick
+        // different cells; a blown-out block's guidance clamps to exactly 1.0, the top plane, where both agree.
+        auto rgb_values = pattern(static_cast<size_t>(pixels) * 3, 0.35f, 11, 0.5f);
+        for (int pixel = 0; pixel < pixels; ++pixel) {
+            const int px = pixel % w, py = pixel / w;
+            if (blown_out && px >= w / 4 && px < w / 2 && py >= h / 4 && py < h / 2) {
+                for (int c = 0; c < 3; ++c)
+                    rgb_values[static_cast<size_t>(c) * pixels + pixel] = 1.25f;
+                continue;
+            }
+            for (;;) {
+                const double guidance = 0.299 * rgb_values[pixel] + 0.587 * rgb_values[pixels + pixel] +
+                                        0.114 * rgb_values[2 * pixels + pixel];
+                const double z = std::clamp(guidance, 0.0, 1.0) * (L - 1);
+                if (std::abs(z - std::round(z)) > 1e-3)
+                    break;
+                rgb_values[pixel] += 0.01f;
+            }
+        }
+        const auto grad_values = pattern(static_cast<size_t>(pixels) * 3, 0.5f, 19);
+        const Doubles rgb = widen(rgb_values), grad = widen(grad_values);
+
+        Doubles expected(cells, 0.0);
+        for (int pixel = 0; pixel < pixels; ++pixel) {
+            const V3 v{rgb[pixel], rgb[pixels + pixel], rgb[2 * pixels + pixel]};
+            const V3 g{grad[pixel], grad[pixels + pixel], grad[2 * pixels + pixel]};
+            const Cell c = bilateral_cell(grid, pixel % w, pixel / w, h, w, v);
+            double dl[12]{};
+            if (exposure_chroma) {
+                double sampled[9];
+                for (int ci = 0; ci < 9; ++ci)
+                    sampled[ci] = bilateral_sample(grid, c, ci, offset);
+                for (int ci = 0; ci < 9; ++ci) {
+                    double up[9], down[9];
+                    std::copy_n(sampled, 9, up);
+                    std::copy_n(sampled, 9, down);
+                    up[ci] += 1e-4;
+                    down[ci] -= 1e-4;
+                    const V3 a = color_correct(exposure(v, up[0]), up + 1);
+                    const V3 b = color_correct(exposure(v, down[0]), down + 1);
+                    for (int k = 0; k < 3; ++k)
+                        dl[ci] += g[k] * (a[k] - b[k]) / 2e-4;
+                }
+            } else {
+                for (int ci = 0; ci < 12; ++ci)
+                    dl[ci] = (ci % 4 == 3 ? 1.0 : v[ci % 4]) * g[ci / 4];
+            }
+            const double weights[8] = {
+                (1 - c.fx) * (1 - c.fy) * (1 - c.fz), c.fx * (1 - c.fy) * (1 - c.fz),
+                (1 - c.fx) * c.fy * (1 - c.fz), c.fx * c.fy * (1 - c.fz),
+                (1 - c.fx) * (1 - c.fy) * c.fz, c.fx * (1 - c.fy) * c.fz,
+                (1 - c.fx) * c.fy * c.fz, c.fx * c.fy * c.fz};
+            const int cx[8] = {c.x0, c.x1, c.x0, c.x1, c.x0, c.x1, c.x0, c.x1};
+            const int cy[8] = {c.y0, c.y0, c.y1, c.y1, c.y0, c.y0, c.y1, c.y1};
+            const int cz[8] = {c.z0, c.z0, c.z0, c.z0, c.z1, c.z1, c.z1, c.z1};
+            for (int ci = 0; ci < channels; ++ci)
+                for (int k = 0; k < 8; ++k)
+                    expected[((static_cast<size_t>(ci) * L + cz[k]) * H + cy[k]) * W + cx[k]] += weights[k] * dl[ci];
+        }
+
+        const TensorShape image{3, size_t(h), size_t(w)};
+        const auto grid_t = gpu(grid_values, {1, static_cast<size_t>(channels), size_t(L), size_t(H), size_t(W)});
+        auto grad_grid = Tensor::zeros(grid_t.shape(), Device::GPU);
+        auto grad_rgb = Tensor::zeros(image, Device::GPU);
+        table.slice_backward(grid_t, gpu(rgb_values, image), gpu(grad_values, image),
+                             gpu(offset_values, {static_cast<size_t>(channels)}), grad_grid, grad_rgb,
+                             {ops::Layout::CHW, exposure_chroma ? ops::GridTransform::ExposureChroma : ops::GridTransform::Affine, true});
+        double largest = 0;
+        for (const double value : expected)
+            largest = std::max(largest, std::abs(value));
+        expect_close(host(grad_grid), expected, 1e-5 * largest, 1e-4, what);
+    }
+
+    // Cells far larger than the kernels' tiles, as at full resolution: thousands of pixels share each cell's sums, and
+    // tiles straddle cell borders, so one SIMD group holds pixels of the tile's base cell and of its neighbour (the
+    // cases above have a few pixels per cell). Also grids with more levels than the threadgroup sums cover, a
+    // blown-out block at the top level, and images one pixel high or wide.
+    TEST_P(PortableAppearance, BilateralGridGradientOverLargeCellsMatchesReference) {
+        check_grid_gradient(200, 320, 3, 4, 8, false, false);
+        check_grid_gradient(200, 320, 3, 4, 8, true, false);
+        check_grid_gradient(200, 320, 3, 4, 12, true, false);
+        check_grid_gradient(200, 320, 3, 4, 8, true, true);
+        check_grid_gradient(200, 320, 3, 4, 8, false, true);
+        check_grid_gradient(1, 70, 3, 4, 8, true, false);
+        check_grid_gradient(45, 1, 3, 4, 12, false, false);
+    }
+
     TEST_P(PortableAppearance, BilateralRegularizerAndOptimizer) {
         const auto& table = *this->table().bilateral;
         constexpr int N = 2, C = 9, L = 3, H = 4, W = 5, norm_n = 7;

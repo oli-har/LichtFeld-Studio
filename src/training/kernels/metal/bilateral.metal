@@ -180,61 +180,128 @@ kernel void bilateral_slice_backward_rgb(constant BilateralSliceParams& p [[buff
 // each thread 2x2 pixels.
 constant constexpr int kBilateralTile = 32;
 
+// Grid levels the threadgroup sums cover; grids with more levels add every total with device atomics.
+constant constexpr int kBilateralSliceLevels = 8;
+constant constexpr int kBilateralSimdGroups = 8; // 16x16 threads
+// One SIMD group's sums for its tile's base cell: channel, level, spatial corner.
+constant constexpr int kBilateralSlice = 12 * kBilateralSliceLevels * 4;
+
 kernel void bilateral_slice_backward_grid(constant BilateralSliceParams& p [[buffer(0)]],
                                           uint2 tile [[threadgroup_position_in_grid]],
                                           uint2 thread_in_tile [[thread_position_in_threadgroup]],
-                                          uint lane [[thread_index_in_simdgroup]]) {
+                                          uint lane [[thread_index_in_simdgroup]],
+                                          uint simd [[simdgroup_index_in_threadgroup]],
+                                          uint rank [[thread_index_in_threadgroup]]) {
+    threadgroup float slices[kBilateralSimdGroups * kBilateralSlice];
     const int channels = p.exposure_chroma != 0 ? 9 : 12;
     const int L = p.L, H = p.H, W = p.W, h = p.h, w = p.w;
     const int px0 = int(tile.x) * kBilateralTile, py0 = int(tile.y) * kBilateralTile;
+    // The tile's base cell is its first pixel's, as bilateral_cell places it. Cells span hundreds of pixels at full
+    // resolution, so most sums are for it; they collect in the SIMD group's slice and go out once per tile.
+    const int base_x = w > 1 ? int(floor(float(min(px0, w - 1)) / float(w - 1) * float(W - 1))) : 0;
+    const int base_y = h > 1 ? int(floor(float(min(py0, h - 1)) / float(h - 1) * float(H - 1))) : 0;
+    const bool sliced = L <= kBilateralSliceLevels;
+    for (uint e = rank; e < uint(kBilateralSimdGroups * kBilateralSlice); e += kBilateralSimdGroups * 32u)
+        slices[e] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* const own = slices + simd * uint(kBilateralSlice);
 
-    for (int dy = 0; dy < 2; ++dy) {
-        for (int dx = 0; dx < 2; ++dx) {
-            const int wi = px0 + int(thread_in_tile.x) * 2 + dx;
-            const int hi = py0 + int(thread_in_tile.y) * 2 + dy;
-            // Every lane stays in the loop: the SIMD reductions below need the whole group.
-            const bool valid = wi < w && hi < h;
-            const int pixel = valid ? hi * w + wi : 0;
-            const float3 rgb = bilateral_finite_or(bilateral_load(p, p.rgb, pixel), 0.5f);
-            const float3 grad = valid ? bilateral_finite_or(bilateral_load(p, p.grad_output, pixel), 0.0f) : 0.0f;
-            const BilateralCell c = bilateral_cell(p, min(wi, w - 1), min(hi, h - 1), rgb);
-            float dl[12];
-            if (p.exposure_chroma != 0) {
-                float sampled[9];
-                for (int ci = 0; ci < 9; ++ci)
-                    sampled[ci] = bilateral_sample(p, c, ci);
-                bilateral_exposure_chroma_vjp(rgb, sampled, grad, dl);
-            } else {
-                for (int ci = 0; ci < 12; ++ci)
-                    dl[ci] = bilateral_coefficient(rgb, ci) * grad[ci / 4];
-            }
-            const float weights[8] = {
-                (1 - c.fx) * (1 - c.fy) * (1 - c.fz), c.fx * (1 - c.fy) * (1 - c.fz),
-                (1 - c.fx) * c.fy * (1 - c.fz), c.fx * c.fy * (1 - c.fz),
-                (1 - c.fx) * (1 - c.fy) * c.fz, c.fx * (1 - c.fy) * c.fz,
-                (1 - c.fx) * c.fy * c.fz, c.fx * c.fy * c.fz};
-            const int cx[8] = {c.x0, c.x1, c.x0, c.x1, c.x0, c.x1, c.x0, c.x1};
-            const int cy[8] = {c.y0, c.y0, c.y1, c.y1, c.y0, c.y0, c.y1, c.y1};
-            const int cz[8] = {c.z0, c.z0, c.z0, c.z0, c.z1, c.z1, c.z1, c.z1};
-            // A 32x4-pixel SIMD group spans few grid cells, so lanes in the same base
-            // cell sum their gradients first and one of them adds the totals. Metal has
-            // no threadgroup float atomics; a shared histogram's compare-and-swap adds
-            // cost more than the device atomics they save.
-            const int cell = (c.z0 * H + c.y0) * W + c.x0;
-            bool pending = valid;
-            while (simd_any(pending)) {
-                const ushort leader = ushort(simd_min(pending ? lane : 32u));
-                const bool mine = pending && cell == simd_shuffle(cell, leader);
-                pending = pending && !mine;
-                for (int ci = 0; ci < channels; ++ci) {
-                    for (int k = 0; k < 8; ++k) {
-                        const float value = simd_sum(mine ? weights[k] * dl[ci] : 0.0f);
-                        if (lane == leader)
-                            ppisp_atomic_add(p.grad_grid + (ci * L + cz[k]) * H * W + cy[k] * W + cx[k], value);
-                    }
-                }
-            }
+    // The thread's 2x2 pixels: their gradients with respect to the sampled grid channels, and their cells.
+    float dl[4][12];
+    float fx[4], fy[4], fz[4];
+    int cell[4];
+    uint pending = 0;
+    for (int n = 0; n < 4; ++n) {
+        const int wi = px0 + int(thread_in_tile.x) * 2 + n % 2;
+        const int hi = py0 + int(thread_in_tile.y) * 2 + n / 2;
+        const bool valid = wi < w && hi < h;
+        const int pixel = valid ? hi * w + wi : 0;
+        const float3 rgb = bilateral_finite_or(bilateral_load(p, p.rgb, pixel), 0.5f);
+        const float3 grad = valid ? bilateral_finite_or(bilateral_load(p, p.grad_output, pixel), 0.0f) : 0.0f;
+        const BilateralCell c = bilateral_cell(p, min(wi, w - 1), min(hi, h - 1), rgb);
+        if (p.exposure_chroma != 0) {
+            float sampled[9];
+            for (int ci = 0; ci < 9; ++ci)
+                sampled[ci] = bilateral_sample(p, c, ci);
+            bilateral_exposure_chroma_vjp(rgb, sampled, grad, dl[n]);
+            dl[n][9] = dl[n][10] = dl[n][11] = 0.0f;
+        } else {
+            for (int ci = 0; ci < 12; ++ci)
+                dl[n][ci] = bilateral_coefficient(rgb, ci) * grad[ci / 4];
         }
+        fx[n] = c.fx;
+        fy[n] = c.fy;
+        fz[n] = c.fz;
+        cell[n] = (c.z0 * H + c.y0) * W + c.x0;
+        if (valid)
+            pending |= 1u << n;
+    }
+
+    // A 32x4-pixel SIMD group spans few grid cells: per cell its lanes sum their pixels' gradients, four channels at a
+    // time through SIMD sums that every lane receives, and lane l keeps channel 4q + l / 8 at corner l % 8. Metal has
+    // no threadgroup float atomics, so the base cell's totals go to the SIMD group's own slice (the lanes' slots
+    // differ, except a top-level cell's two levels, whose upper corners then carry exact zeros, which are skipped)
+    // and other cells' to the grid with device atomics.
+    const int k = int(lane % 8u);
+    while (simd_any(pending != 0)) {
+        const ushort leader = ushort(simd_min(pending != 0 ? lane : 32u));
+        int first = 0;
+        for (int n = 3; n >= 0; --n)
+            if ((pending & (1u << n)) != 0)
+                first = cell[n];
+        const int lead_cell = simd_shuffle(first, leader);
+        uint mine = 0;
+        for (int n = 0; n < 4; ++n)
+            if ((pending & (1u << n)) != 0 && cell[n] == lead_cell)
+                mine |= 1u << n;
+        pending &= ~mine;
+        const int x0 = lead_cell % W, y0 = lead_cell / W % H, z0 = lead_cell / (W * H);
+        const int x1 = min(x0 + 1, W - 1), y1 = min(y0 + 1, H - 1), z1 = min(z0 + 1, L - 1);
+        const int z = (k & 4) != 0 ? z1 : z0;
+        const int corner = (z * H + ((k & 2) != 0 ? y1 : y0)) * W + ((k & 1) != 0 ? x1 : x0);
+        const bool base = sliced && x0 == base_x && y0 == base_y;
+        for (int q = 0; q < 3; ++q) {
+            float total = 0.0f;
+            for (int kk = 0; kk < 8; ++kk) {
+                float4 value = 0.0f;
+                for (int n = 0; n < 4; ++n) {
+                    if ((mine & (1u << n)) == 0)
+                        continue;
+                    const float wx = (kk & 1) != 0 ? fx[n] : 1 - fx[n];
+                    const float wy = (kk & 2) != 0 ? fy[n] : 1 - fy[n];
+                    const float wz = (kk & 4) != 0 ? fz[n] : 1 - fz[n];
+                    value += wx * wy * wz * float4(dl[n][4 * q], dl[n][4 * q + 1], dl[n][4 * q + 2], dl[n][4 * q + 3]);
+                }
+                const float4 sums = simd_sum(value);
+                if (kk == k)
+                    total = sums[lane / 8u];
+            }
+            const int ci = 4 * q + int(lane / 8u);
+            if (ci >= channels || total == 0.0f)
+                continue;
+            if (base)
+                own[(ci * kBilateralSliceLevels + z) * 4 + (k & 3)] += total;
+            else
+                ppisp_atomic_add(p.grad_grid + ci * L * H * W + corner, total);
+        }
+        // The next cell's lanes may update this cell's slots (an upper level of one cell is a lower level of the
+        // next): order the SIMD group's threadgroup accesses between iterations.
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!sliced)
+        return;
+    const int base_x1 = min(base_x + 1, W - 1), base_y1 = min(base_y + 1, H - 1);
+    for (uint e = rank; e < uint(channels * kBilateralSliceLevels * 4); e += kBilateralSimdGroups * 32u) {
+        float total = 0.0f;
+        for (int g = 0; g < kBilateralSimdGroups; ++g)
+            total += slices[uint(g * kBilateralSlice) + e];
+        if (total == 0.0f)
+            continue;
+        const int ci = int(e) / (kBilateralSliceLevels * 4), z = int(e) / 4 % kBilateralSliceLevels, s = int(e) % 4;
+        const int x = (s & 1) != 0 ? base_x1 : base_x, y = (s & 2) != 0 ? base_y1 : base_y;
+        ppisp_atomic_add(p.grad_grid + ((ci * L + z) * H + y) * W + x, total);
     }
 }
 
