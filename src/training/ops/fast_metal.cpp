@@ -42,7 +42,9 @@ namespace lfs::training {
         constexpr uint32_t kShSlotsPerThread = 6;
         // kFastBwdThreads in fast_backward.metal.
         constexpr uint32_t kBackwardThreads = 64;
-        constexpr uint32_t kGradStride = 12;
+        // fast_grad_stride in fast_backward.metal: floats per primitive in the
+        // blend backward's row of sums.
+        constexpr uint32_t grad_stride(const bool normal_channel) { return normal_channel ? 16 : 12; }
         constexpr uint32_t kScanBlock = 2048;
         constexpr uint32_t kSortBlock = 2048;
         constexpr float kNearPlane = 0.01f;
@@ -78,7 +80,7 @@ namespace lfs::training {
             Tensor image, alpha, depth, normal;
             int width = -1, height = -1;
             Tensor mean_box, conic_opacity, color_depth, tile_info, normals, n_touched, offsets;
-            Tensor grads, normal_grads;
+            Tensor grads;
             Tensor ranges, final_transmittance, n_contrib, coverage;
             Tensor block_sums, counts, histogram;
             std::array<Tensor, 2> keys, values, depth_keys, depth_order;
@@ -663,13 +665,13 @@ namespace lfs::training {
             uint64_t counts, ranges, values, coverage, mean_box, conic_opacity, color_depth, normals;
             uint64_t grad_image, grad_alpha, grad_depth, grad_normal, bg_color, bg_image, n_contrib,
                 final_transmittance;
-            uint64_t grads, normal_grads, densification, error_map, edge_weight, edge_score, impact_sum, impact_peak;
+            uint64_t grads, error_map, edge_weight, edge_score, impact_sum, impact_peak;
             uint32_t n_instances, n_primitives, width, height;
             uint32_t grid_w, capacity, unused1, unused2;
         };
 
         struct ClearGradParams {
-            uint64_t counts, n_touched, grads, normal_grads;
+            uint64_t counts, n_touched, grads;
             uint32_t n, capacity;
         };
 
@@ -683,7 +685,7 @@ namespace lfs::training {
         };
 
         struct BackwardGeometryParams {
-            uint64_t counts, means, scales, rotations, opacities, view, camera, n_touched, grads, normal_grads;
+            uint64_t counts, means, scales, rotations, opacities, view, camera, n_touched, grads;
             uint64_t densification, scale_loss, opacity_loss;
             AdamGroupParams means_adam, rotation_adam, scaling_adam, opacity_adam;
             float beta1, beta2, eps;
@@ -695,6 +697,7 @@ namespace lfs::training {
             uint64_t rendered_count, erank_loss, mean_far;
             float scale_normalizer, erank_weight, mean_median;
             uint32_t per_splat_mean_step;
+            uint64_t blend_densification, edge_score;
         };
 
         // A read-only per-pixel map given as [H, W] or [1, H, W], made contiguous.
@@ -818,17 +821,12 @@ namespace lfs::training {
             if (!std::ranges::any_of(adam.groups, [](const auto& g) { return g.enabled || g.gradient.is_valid(); }))
                 throw std::runtime_error("FastGS fused Adam state is not available");
 
-            reserve(s.grads, f.primitive_capacity * kGradStride, DataType::Float32,
+            reserve(s.grads, f.primitive_capacity * grad_stride(normal_channel), DataType::Float32,
                     "fast.backward.grads", false);
-            if (normal_channel) {
-                reserve(s.normal_grads, f.primitive_capacity * 4, DataType::Float32,
-                        "fast.backward.normal_grads", false);
-            }
             const Tensor none;
-            const Tensor& normal_grads_use = normal_channel ? s.normal_grads : none;
-            const ClearGradParams clear{mk::address(s.counts), mk::address(s.n_touched), mk::address(s.grads),
-                                        normal_channel ? mk::address(s.normal_grads) : 0, f.n, s.pending_capacity};
-            launch("fast_clear_visible_grads", clear, {&s.counts, &s.n_touched, &s.grads, &normal_grads_use},
+            const ClearGradParams clear{mk::address(s.counts), mk::address(s.n_touched), mk::address(s.grads), f.n,
+                                        s.pending_capacity};
+            launch("fast_clear_visible_grads", clear, {&s.counts, &s.n_touched, &s.grads},
                    core::GpuKernelModule::groups_for(f.n, 256), 1, 256,
                    {{kNormalChannelConstant, normal_channel ? 1u : 0u}});
 
@@ -836,7 +834,6 @@ namespace lfs::training {
                 const bool has_bg_image = present(f.bg_image);
                 const bool solid_bg = !has_bg_image && f.bg_color.is_valid() && f.bg_color.numel() >= 3;
                 const Tensor& bg_use = has_bg_image ? f.bg_image : (solid_bg ? f.bg_color : none);
-                const Tensor& densification_use = blend_densification != 0 ? densification : none;
                 const BlendBackwardParams params{
                     .counts = mk::address(s.counts),
                     .ranges = mk::address(s.ranges),
@@ -855,8 +852,6 @@ namespace lfs::training {
                     .n_contrib = mk::address(s.n_contrib),
                     .final_transmittance = mk::address(s.final_transmittance),
                     .grads = mk::address(s.grads),
-                    .normal_grads = normal_channel ? mk::address(s.normal_grads) : 0,
-                    .densification = blend_densification != 0 ? mk::address(densification) : 0,
                     .error_map = pixel_error ? mk::address(error) : 0,
                     .edge_weight = address_if(edge_weight),
                     .edge_score = address_if(edge_scores),
@@ -877,7 +872,7 @@ namespace lfs::training {
                 launch("fast_blend_backward", params,
                        {&s.counts, &s.ranges, &s.values[f.sorted], &s.coverage, &s.mean_box, &s.conic_opacity,
                         &s.color_depth, &normals_use, &grad_image, &grad_alpha, &grad_depth, &grad_normal, &bg_use, &s.n_contrib,
-                        &s.final_transmittance, &s.grads, &normal_grads_use, &densification_use, &error, &edge_weight,
+                        &s.final_transmittance, &s.grads, &error, &edge_weight,
                         &edge_scores, &impact_sum_use, &impact_peak_use},
                        f.grid_w * f.grid_h, 1, kBackwardThreads,
                        {{kDensificationConstant, blend_densification},
@@ -921,17 +916,19 @@ namespace lfs::training {
             launch("fast_backward_sh", sh, std::span<const Tensor* const>(uses), blocks, 1, 256 * kShParts,
                    {{kShBasesConstant, f.sh_bases},
                     {kShLayoutRestConstant, f.sh_layout_rest},
-                    {kShStorageConstant, f.sh_storage}});
+                    {kShStorageConstant, f.sh_storage},
+                    {kNormalChannelConstant, normal_channel ? 1u : 0u}});
 
             const bool scale_loss = adam.scale_reg_weight > 0.f && present(adam.scale_reg_loss);
             const bool opacity_loss = adam.opacity_reg_weight > 0.f && present(adam.opacity_reg_loss);
             const auto& means_group = group(AdamSlot::Means);
 
             const ClipBounds clip = clip_bounds(f);
-            uses = {&s.counts, &f.means, &f.scales, &f.rotations, &f.opacities, &f.view, &f.camera, &s.n_touched, &s.grads,
-                    &normal_grads_use};
-            if (count_visible)
+            uses = {&s.counts, &f.means, &f.scales, &f.rotations, &f.opacities, &f.view, &f.camera, &s.n_touched, &s.grads};
+            if (count_visible || blend_densification != 0)
                 uses.push_back(&densification);
+            if (normal_channel && present(edge_scores))
+                uses.push_back(&edge_scores);
             if (scale_loss)
                 uses.push_back(&adam.scale_reg_loss);
             if (opacity_loss)
@@ -949,7 +946,6 @@ namespace lfs::training {
                 .camera = mk::address(f.camera),
                 .n_touched = mk::address(s.n_touched),
                 .grads = mk::address(s.grads),
-                .normal_grads = normal_channel ? mk::address(s.normal_grads) : 0,
                 .densification = count_visible ? mk::address(densification) : 0,
 
                 .scale_loss = scale_loss ? mk::address(adam.scale_reg_loss) : 0,
@@ -983,10 +979,11 @@ namespace lfs::training {
                 .erank_weight = adam.erank_reg_weight,
                 .mean_median = adam.mean_step_median_extent,
                 .per_splat_mean_step = adam.per_splat_mean_step,
-
+                .blend_densification = blend_densification != 0 ? mk::address(densification) : 0,
+                .edge_score = normal_channel ? address_if(edge_scores) : 0,
             };
             launch("fast_backward_geometry", geometry, std::span<const Tensor* const>(uses), blocks, 1, 256,
-                   {{kMipFilterConstant, f.mip_filter ? 1u : 0u}});
+                   {{kMipFilterConstant, f.mip_filter ? 1u : 0u}, {kNormalChannelConstant, normal_channel ? 1u : 0u}});
         }
 
         void release(lfs::gpu_ops::FastSaved& saved) noexcept {
@@ -1068,8 +1065,7 @@ namespace lfs::training {
             record_vram_current(scope, "forward.per_tile_buffers", per_tile);
             record_vram_current(scope, "forward.sort_buffers", sort);
             record_vram_current(scope, "backward.gradient_helpers",
-                                run_gaussian_backward ? num_primitives * (kGradStride + (s->frame.normals ? 4 : 0)) *
-                                                            sizeof(float)
+                                run_gaussian_backward ? num_primitives * grad_stride(s->frame.normals) * sizeof(float)
                                                       : 0,
                                 true);
             record_vram_tensor(scope, "output.image", image);

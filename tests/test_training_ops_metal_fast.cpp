@@ -1328,6 +1328,77 @@ namespace {
         }
     }
 
+    // The blend backward sums a splat's densification weight and error and its edge score in the splat's row of
+    // its gradient buffer, whose layout depends on the normal channel; the geometry pass adds them to MRNF's
+    // buffers. Both layouts must add the reference sums to what the buffers already hold and leave the entries of
+    // splats outside the image untouched.
+    TEST_P(PortableFastRaster, DensificationAndEdgeSumsAddToTheirBuffers) {
+        Scene s = make_scene(30, 1, 48, 40, 46u, -2.3f, -1.6f);
+        for (int i = 0; i < s.count; ++i) {
+            s.means[i * 3] *= 0.6f;
+            s.means[i * 3 + 1] *= 0.6f;
+        }
+        for (int i = 0; i < s.count; i += 5)
+            s.means[i * 3] = 40.0f; // far outside the image
+        const auto n = static_cast<size_t>(s.count);
+        const auto height = static_cast<size_t>(s.height), width = static_cast<size_t>(s.width);
+        std::mt19937 rng(9u);
+        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+        std::vector<float> error(height * width), edge(height * width), normal_grad(3 * height * width);
+        std::vector<float> initial_densification(2 * n), initial_edge(n);
+        for (auto* values : {&error, &edge, &initial_densification, &initial_edge})
+            for (auto& v : *values)
+                v = uniform(rng);
+        for (auto& v : normal_grad)
+            v = uniform(rng) - 0.5f;
+        const LossWeights w = random_weights(s.width, s.height, 16u, false);
+        const View view = make_view(s, false);
+        const Params base(s);
+        const Rendered r = render(s, base, view, nullptr, &error, &edge);
+        std::vector<double> weight(n), weight_error(n), edge_score(n);
+        double error_scale = 1.0;
+        for (size_t i = 0; i < n; ++i) {
+            weight[i] = initial_densification[i] + r.weight[i];
+            weight_error[i] = initial_densification[n + i] + r.weight_error[i];
+            edge_score[i] = initial_edge[i] + r.weight_edge[i];
+            error_scale = std::max(error_scale, std::abs(weight_error[i]));
+        }
+        for (const bool normals : {false, true}) {
+            SCOPED_TRACE(normals ? "normal channel" : "no normal channel");
+            Gpu g = upload_scene(s, ops::ShStorage::Float32);
+            Frame frame;
+            forward(frame, s, g, {.normals = normals});
+            ASSERT_EQ(frame.result.code, ops::RasterResult::Code::Success) << frame.result.message;
+            AdamState state;
+            const ops::BackwardAdam adam = make_adam(g, state, s.count, {});
+            Tensor densification = upload(initial_densification, {2, n});
+            Tensor edge_scores = upload(initial_edge, {n});
+            Tensor none;
+            const Tensor grad_image = plane(w.image, 3, s.height, s.width);
+            const Tensor grad_normal = normals ? plane(normal_grad, 3, s.height, s.width) : none;
+            const Tensor error_map = upload(error, {height, width});
+            const Tensor edge_map = upload(edge, {height, width});
+            fast_ops().backward(frame.saved, {.image = grad_image, .alpha = none, .depth = none, .normal = grad_normal},
+                                densification, error_map, edge_map, edge_scores, adam, DensificationType::MRNF);
+            const std::vector<float> dens = download(densification);
+            const std::vector<float> edges = download(edge_scores);
+            size_t outside = 0;
+            for (size_t i = 0; i < n; ++i) {
+                if (project(s, base, view, static_cast<int>(i), true).visible)
+                    continue;
+                ++outside;
+                EXPECT_EQ(dens[i], initial_densification[i]) << i;
+                EXPECT_EQ(dens[n + i], initial_densification[n + i]) << i;
+                EXPECT_EQ(edges[i], initial_edge[i]) << i;
+            }
+            EXPECT_GT(outside, 0u);
+            expect_close(std::vector<float>(dens.begin(), dens.begin() + n), weight, 1e-4, "densification weight");
+            expect_close(std::vector<float>(dens.begin() + n, dens.end()), weight_error, 2e-3 * error_scale,
+                         "densification error");
+            expect_close(edges, edge_score, 1e-4, "edge scores");
+        }
+    }
+
     // Catches a removal impact that misses the composite behind each splat: MRNF's growth
     // exchange frees the splats whose removal changes the image least.
     TEST_P(PortableFastRaster, RemovalImpactMatchesReference) {
