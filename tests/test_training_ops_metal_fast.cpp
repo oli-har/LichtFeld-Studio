@@ -13,6 +13,7 @@
 #include "core/gpu_backend_fwd.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor_backend.hpp"
+#include "lfs/training/joint_adam_codec.hpp"
 #include "lfs/training/ops/popspa.hpp"
 #include "lfs/training/ops/registry.hpp"
 #ifdef LFS_TENSOR_METAL
@@ -30,7 +31,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <format>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -1778,6 +1781,336 @@ namespace {
                 EXPECT_GT(two.sh_loss, 0.0f);
                 EXPECT_NEAR(one.dc_loss, two.dc_loss, 1e-5f * two.dc_loss);
                 EXPECT_NEAR(one.sh_loss, two.sh_loss, 1e-5f * two.sh_loss);
+            }
+        }
+    }
+
+    // fast_backward_sh's fused Adam step on the CPU, transliterated as test_training_ops_metal_adam_sh.cpp does for
+    // the Adam family: the joint (u, log_s) moment codec with bounds per 256-primitive block, sh0 rows with 16-bit
+    // moments, shN float4 slots with 8-bit moments, and Q16 values re-encoded under their block's new value bounds.
+    namespace joint = lfs::training::joint_adam;
+
+    // A code may differ by one where the value it rounds lies within kCodeTie of a half step: the GPU's fast log and
+    // exp differ from the CPU's in the last bits.
+    constexpr float kCodeTie = 0.05f;
+
+    // Codes of 8 or 16 bits, each with the unrounded value the reference rounded into it (NaN: not written).
+    struct Codes {
+        int bits = 8;
+        std::vector<uint8_t> bytes;
+        std::vector<float> unrounded;
+
+        Codes(const int code_bits, std::vector<uint8_t> raw)
+            : bits(code_bits),
+              bytes(std::move(raw)),
+              unrounded(bytes.size() * 8 / code_bits, std::numeric_limits<float>::quiet_NaN()) {}
+
+        float q_max() const { return static_cast<float>((1 << bits) - 1); }
+
+        uint32_t get(const size_t i) const {
+            if (bits == 8)
+                return bytes[i];
+            uint16_t code = 0;
+            std::memcpy(&code, &bytes[2 * i], 2);
+            return code;
+        }
+
+        void put(const size_t i, const float x) {
+            const auto q = static_cast<uint32_t>(std::clamp(std::round(x), 0.0f, q_max()));
+            if (bits == 8) {
+                bytes[i] = static_cast<uint8_t>(q);
+            } else {
+                const auto code = static_cast<uint16_t>(q);
+                std::memcpy(&bytes[2 * i], &code, 2);
+            }
+            unrounded[i] = x;
+        }
+
+        // The GPU codecs decode with an fma.
+        float decode(const size_t i, const float lo, const float hi) const {
+            return std::fma(hi - lo, static_cast<float>(get(i)) * (1.0f / q_max()), lo);
+        }
+    };
+
+    // The GPU's codes against the reference's: equal, or one apart where the reference's unrounded value lies within
+    // kCodeTie of a half step.
+    void expect_codes(const std::vector<uint8_t>& actual_bytes, const Codes& expected, const std::string& name) {
+        const Codes actual(expected.bits, actual_bytes);
+        ASSERT_EQ(actual.bytes.size(), expected.bytes.size()) << name;
+        size_t mismatches = 0;
+        for (size_t i = 0; i < expected.unrounded.size(); ++i) {
+            const uint32_t a = actual.get(i), e = expected.get(i);
+            const float x = expected.unrounded[i];
+            const bool tie = std::abs(x - std::floor(x) - 0.5f) <= kCodeTie && (a == e + 1 || e == a + 1);
+            if (a != e && !tie && ++mismatches <= 4)
+                ADD_FAILURE() << name << " code " << i << ": " << a << " vs " << e << " from " << x;
+        }
+        EXPECT_EQ(mismatches, 0u) << name;
+    }
+
+    void expect_all_near(const std::vector<float>& actual, const std::vector<float>& expected, const double abs,
+                         const double rel, const std::string& name) {
+        ASSERT_EQ(actual.size(), expected.size()) << name;
+        size_t mismatches = 0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const double limit = abs + rel * std::abs(static_cast<double>(expected[i]));
+            if (!(std::abs(static_cast<double>(actual[i]) - expected[i]) <= limit) && ++mismatches <= 4)
+                ADD_FAILURE() << name << " " << i << ": " << actual[i] << " vs " << expected[i];
+        }
+        EXPECT_EQ(mismatches, 0u) << name;
+    }
+
+    // The SH groups' state that fast_backward_sh reads and writes.
+    struct ShState {
+        std::vector<float> sh0, shN; // shN: float or half values, as float
+        std::vector<float> sh0_bounds, shN_bounds, value_bounds;
+        Codes sh0_moments{16, {}}, shN_moments{8, {}}, values{16, {}}; // values: Q16 codes
+    };
+
+    ShState read_sh_state(const Gpu& g, const AdamState& state) {
+        constexpr size_t kSh0 = static_cast<size_t>(ops::AdamSlot::Sh0);
+        constexpr size_t kShN = static_cast<size_t>(ops::AdamSlot::ShN);
+        ShState s;
+        s.sh0 = download(g.sh0);
+        s.sh0_moments = Codes(16, download_bytes(state.moments[kSh0]));
+        s.sh0_bounds = download(state.bounds[kSh0]);
+        if (g.layout_rest == 0)
+            return s;
+        if (g.storage == ops::ShStorage::Q16) {
+            s.values = Codes(16, download_bytes(g.shN));
+            s.value_bounds = download(g.bounds);
+        } else {
+            s.shN = download(g.shN.to(DataType::Float32));
+        }
+        s.shN_moments = Codes(8, download_bytes(state.moments[kShN]));
+        s.shN_bounds = download(state.bounds[kShN]);
+        return s;
+    }
+
+    // A cell of an Adam step: where its moments sit, its gradient, and its value (nullptr: a Q16 slot's padding).
+    struct StepCell {
+        size_t moments;
+        float grad;
+        float* value;
+    };
+
+    // One 256-primitive block of the step: each cell's moments decoded under the block's old bounds and stepped, its
+    // value moved by the Adam delta, then the moments encoded under the block's new bounds (zero without cells).
+    template <int BITS>
+    void reference_block_step(Codes& moments, float* bounds, const std::vector<StepCell>& cells, const AdamSetup& h) {
+        using Codec = joint::Codec<BITS>;
+        const std::array<float, 4> old{bounds[0], bounds[1], bounds[2], bounds[3]};
+        std::vector<std::array<float, 2>> us(cells.size());
+        float lo_u = 1e30f, hi_u = -1e30f, lo_s = 1e30f, hi_s = -1e30f;
+        for (size_t i = 0; i < cells.size(); ++i) {
+            const StepCell& c = cells[i];
+            float m = 0.0f, v = 0.0f;
+            Codec::us_to_g1g2(moments.decode(2 * c.moments, old[0], old[1]),
+                              moments.decode(2 * c.moments + 1, old[2], old[3]), m, v);
+            m = h.beta1 * m + (1.0f - h.beta1) * c.grad;
+            v = h.beta2 * v + (1.0f - h.beta2) * c.grad * c.grad;
+            if (c.value != nullptr)
+                *c.value -= h.step * m / (std::sqrt(v) * h.bc2_sqrt_rcp + h.eps);
+            Codec::g1g2_to_us(m, v, us[i][0], us[i][1]);
+            lo_u = std::min(lo_u, us[i][0]);
+            hi_u = std::max(hi_u, us[i][0]);
+            lo_s = std::min(lo_s, us[i][1]);
+            hi_s = std::max(hi_s, us[i][1]);
+        }
+        if (lo_u > hi_u)
+            lo_u = hi_u = lo_s = hi_s = 0.0f;
+        bounds[0] = lo_u;
+        bounds[1] = hi_u;
+        bounds[2] = lo_s;
+        bounds[3] = hi_s;
+        const float inv_u = 1.0f / std::max(hi_u - lo_u, joint::kEps);
+        const float inv_s = 1.0f / std::max(hi_s - lo_s, joint::kEps);
+        for (size_t i = 0; i < cells.size(); ++i) {
+            moments.put(2 * cells[i].moments, moments.q_max() * (us[i][0] - lo_u) * inv_u);
+            moments.put(2 * cells[i].moments + 1, moments.q_max() * (us[i][1] - lo_s) * inv_s);
+        }
+    }
+
+    // The step from the gradients a capture pass records: sh0 rows of three, then every cell of shN's float4 slots
+    // (padding included), whose Q16 values take new block bounds.
+    void reference_sh_step(ShState& s, const std::vector<float>& sh0_grad, const std::vector<float>& shN_grad,
+                           const uint32_t n, const uint32_t layout_rest, const bool q16, const AdamSetup& h) {
+        const uint32_t slots = float4_slots(layout_rest), cells = layout_rest * 3;
+        for (uint32_t b = 0; b * 256 < n; ++b) {
+            const uint32_t first = b * 256, last = std::min(n, first + 256);
+            std::vector<StepCell> sh0_cells;
+            for (size_t i = size_t{first} * 3; i < size_t{last} * 3; ++i)
+                sh0_cells.push_back({i, sh0_grad[i], &s.sh0[i]});
+            reference_block_step<16>(s.sh0_moments, &s.sh0_bounds[4 * b], sh0_cells, h);
+            if (slots == 0)
+                continue;
+            std::vector<float> values(size_t{last - first} * cells); // the block's Q16 values
+            std::vector<StepCell> shN_cells;
+            for (uint32_t p = first; p < last; ++p)
+                for (uint32_t cell = 0; cell < slots * 4; ++cell) {
+                    const size_t at = swizzled_float_index(p, cell / 3, cell % 3, layout_rest);
+                    float* value = q16 ? nullptr : &s.shN[at];
+                    if (q16 && cell < cells) {
+                        value = &values[size_t{p - first} * cells + cell];
+                        *value = s.values.decode(q16_index(p, cell, cells), s.value_bounds[2 * b],
+                                                 s.value_bounds[2 * b + 1]);
+                    }
+                    shN_cells.push_back({at, shN_grad[at], value});
+                }
+            reference_block_step<8>(s.shN_moments, &s.shN_bounds[4 * b], shN_cells, h);
+            if (!q16)
+                continue;
+            float lo = 1e30f, hi = -1e30f;
+            for (const float v : values) {
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            }
+            s.value_bounds[2 * b] = lo;
+            s.value_bounds[2 * b + 1] = hi;
+            for (uint32_t p = first; p < last; ++p)
+                for (uint32_t cell = 0; cell < cells; ++cell)
+                    s.values.put(q16_index(p, cell, cells),
+                                 65535.0f * (values[size_t{p - first} * cells + cell] - lo) / std::max(hi - lo, 1e-20f));
+        }
+    }
+
+    // The regularizer losses fast_backward_sh reports, over the values before its step.
+    std::array<double, 2> reference_sh_losses(const ShState& s, const uint32_t n, const uint32_t layout_rest,
+                                              const bool q16, const double dc_weight, const double sh_weight) {
+        const double limit = 0.5 / 0.28209479177387814;
+        double dc = 0.0, sh = 0.0;
+        for (const float value : s.sh0) {
+            const double delta = value - std::clamp(static_cast<double>(value), -limit, limit);
+            dc += dc_weight / (3.0 * n) * delta * delta;
+        }
+        const uint32_t cells = layout_rest * 3;
+        for (uint32_t p = 0; p < n; ++p)
+            for (uint32_t cell = 0; cell < cells; ++cell) {
+                const double value =
+                    q16 ? s.values.decode(q16_index(p, cell, cells), s.value_bounds[2 * (p / 256)],
+                                          s.value_bounds[2 * (p / 256) + 1])
+                        : s.shN[swizzled_float_index(p, cell / 3, cell % 3, layout_rest)];
+                sh += sh_weight / (static_cast<double>(n) * cells) * value * value;
+            }
+        return {dc, sh};
+    }
+
+    // The SH backward's fused Adam step against the CPU at degrees 0 to 3 (one and two threads per primitive) and in
+    // every SH storage, with the DC and SH-rest regularizers on: SH values, the 16-bit sh0 and 8-bit shN moment codes,
+    // both groups' block bounds, Q16 value codes and bounds, and the reported regularizer losses, over two steps.
+    // Each step's gradients come from a capture pass over the same frame first (the capture tests check them against
+    // the CPU), and the reference starts each step from the GPU's state, so a code rounded the other way at a tie does
+    // not carry over. One pixel keeps every splat's image gradient to a single atomic add, so the capture and the step
+    // see the same gradients. The geometry stays fixed; some splats sit behind the camera, and the partial third block
+    // starts from zero moments and has no gradient at all, so its bounds stay zero.
+    TEST_P(PortableFastRaster, FusedShAdamStepMatchesReference) {
+        constexpr size_t kSh0 = static_cast<size_t>(ops::AdamSlot::Sh0);
+        constexpr size_t kShN = static_cast<size_t>(ops::AdamSlot::ShN);
+        constexpr float kDcWeight = 0.2f, kShWeight = 0.5f;
+        const AdamSetup setup{.beta1 = 0.9f, .eps = 1e-15f, .step = 1e-3f, .bc2_sqrt_rcp = 1.0f / std::sqrt(0.001f)};
+        for (const int degree : {0, 1, 2, 3}) {
+            for (const auto storage : {ops::ShStorage::Float32, ops::ShStorage::IeeeFloat16, ops::ShStorage::Q16}) {
+                if (degree == 0 && storage != ops::ShStorage::Float32)
+                    continue;
+                SCOPED_TRACE(std::format("degree {}, storage {}", degree, static_cast<int>(storage)));
+                const bool q16 = storage == ops::ShStorage::Q16;
+                Scene s = make_scene(600, degree, 1, 1, 91u + static_cast<unsigned>(degree), -2.3f, -1.6f);
+                for (int i = 0; i < 512; i += 7)
+                    s.sh0[3 * i] = 2.1f; // above the DC regularizer's range
+                for (int i = 3; i < 512; i += 11)
+                    s.sh0[3 * i + 1] = -3.0f; // below black: the regularizer gate depends on the image gradient
+                for (int i = 300; i < s.count; ++i) {
+                    if (i < 380 || i >= 512)
+                        s.means[3 * i + 2] = -10.0f; // behind the camera
+                    if (i >= 512)
+                        std::fill_n(s.rest.begin() + 45 * i, 45, 0.0f);
+                }
+                Gpu g = upload_scene(s, storage);
+                const auto n = static_cast<uint32_t>(s.count);
+                AdamState state;
+                ops::BackwardAdam adam = make_adam(g, state, s.count, setup);
+                for (size_t i = 0; i < kSh0; ++i)
+                    adam.groups[i].enabled = false;
+                // Moments from earlier steps in the first two blocks: random codes under bounds with both signs of
+                // u, so that the step's codes spread over the whole range.
+                std::mt19937 rng(7u + static_cast<unsigned>(degree));
+                for (const size_t slot : {kSh0, kShN}) {
+                    if (!state.moments[slot].is_valid())
+                        continue;
+                    std::vector<uint8_t> codes(state.moments[slot].bytes(), 0);
+                    const size_t cells = slot == kSh0 ? 3 : size_t{float4_slots(g.layout_rest)} * 4;
+                    for (size_t i = 0; i < size_t{512} * cells * (slot == kSh0 ? 4 : 2); ++i)
+                        codes[i] = static_cast<uint8_t>(rng());
+                    const std::array<float, 8> earlier{-3.5f, 4.0f, 0.0f, 22.0f, -4.5f, 3.0f, 0.0f, 23.0f};
+                    std::vector<float> bounds(state.bounds[slot].numel(), 0.0f);
+                    std::copy(earlier.begin(), earlier.end(), bounds.begin());
+                    state.moments[slot] = adam.groups[slot].packed_moments =
+                        Tensor::from_blob(codes.data(), {codes.size()}, Device::CPU, DataType::UInt8).to(Device::GPU);
+                    state.bounds[slot] = adam.groups[slot].joint_bounds = upload(bounds, state.bounds[slot].shape());
+                }
+                adam.dc_reg_weight = kDcWeight;
+                adam.sh_rest_reg_weight = kShWeight;
+                const Tensor grad_image = plane(random_weights(1, 1, 15u, false).image, 3, 1, 1);
+                const auto run = [&](const ops::BackwardAdam& a) {
+                    Frame frame;
+                    forward(frame, s, g, {});
+                    EXPECT_EQ(frame.result.code, ops::RasterResult::Code::Success) << frame.result.message;
+                    Tensor none;
+                    fast_ops().backward(frame.saved, {.image = grad_image, .alpha = none, .depth = none, .normal = none},
+                                        none, none, none, none, a, DensificationType::None);
+                    fast_ops().release(frame.saved);
+                };
+                for (int step = 0; step < 2; ++step) {
+                    SCOPED_TRACE(std::format("step {}", step));
+                    ops::BackwardAdam capture = adam;
+                    capture.dc_reg_loss = Tensor::zeros({1}, Device::GPU);
+                    capture.sh_rest_reg_loss = Tensor::zeros({1}, Device::GPU);
+                    for (const size_t slot : {kSh0, kShN}) {
+                        auto& group = capture.groups[slot];
+                        if (!group.enabled)
+                            continue;
+                        group.enabled = false;
+                        group.joint_bits = 0;
+                        group.gradient = Tensor::zeros(slot == kSh0 ? group.parameter.shape()
+                                                                    : lfs::core::TensorShape{padded(n) * float4_slots(g.layout_rest) * 4},
+                                                       Device::GPU);
+                    }
+                    run(capture);
+                    const std::vector<float> sh0_grad = download(capture.groups[kSh0].gradient);
+                    const std::vector<float> shN_grad =
+                        g.layout_rest > 0 ? download(capture.groups[kShN].gradient) : std::vector<float>{};
+                    const ShState before = read_sh_state(g, state);
+                    const auto losses = reference_sh_losses(before, n, g.layout_rest, q16, kDcWeight, kShWeight);
+                    adam.dc_reg_loss = Tensor::zeros({1}, Device::GPU);
+                    adam.sh_rest_reg_loss = Tensor::zeros({1}, Device::GPU);
+                    run(adam);
+
+                    ShState expected = before;
+                    reference_sh_step(expected, sh0_grad, shN_grad, n, g.layout_rest, q16, setup);
+                    const ShState actual = read_sh_state(g, state);
+                    EXPECT_NE(actual.sh0, before.sh0) << "sh0 must take an Adam step";
+                    expect_all_near(actual.sh0, expected.sh0, 1e-6, 1e-5, "sh0");
+                    expect_all_near(actual.sh0_bounds, expected.sh0_bounds, 1e-6, 1e-5, "sh0 moment bounds");
+                    expect_codes(actual.sh0_moments.bytes, expected.sh0_moments, "sh0 moments");
+                    if (g.layout_rest > 0) {
+                        expect_all_near(actual.shN_bounds, expected.shN_bounds, 1e-6, 1e-5, "shN moment bounds");
+                        expect_codes(actual.shN_moments.bytes, expected.shN_moments, "shN moments");
+                        if (q16) {
+                            EXPECT_NE(actual.values.bytes, before.values.bytes) << "shN must take an Adam step";
+                            expect_all_near(actual.value_bounds, expected.value_bounds, 1e-6, 1e-5, "Q16 value bounds");
+                            expect_codes(actual.values.bytes, expected.values, "Q16 values");
+                        } else {
+                            EXPECT_NE(actual.shN, before.shN) << "shN must take an Adam step";
+                            // Half storage rounds the stepped value to 11 significant bits.
+                            expect_all_near(actual.shN, expected.shN, 1e-7,
+                                            storage == ops::ShStorage::IeeeFloat16 ? 1e-3 : 1e-5, "shN");
+                        }
+                    }
+                    EXPECT_GT(losses[0], 0.0);
+                    EXPECT_EQ(losses[1] > 0.0, degree > 0);
+                    EXPECT_NEAR(download(adam.dc_reg_loss)[0], losses[0], 1e-5 * losses[0]);
+                    EXPECT_NEAR(download(adam.sh_rest_reg_loss)[0], losses[1], 1e-5 * losses[1]);
+                }
             }
         }
     }
