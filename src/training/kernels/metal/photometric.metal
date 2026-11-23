@@ -511,18 +511,17 @@ struct PhotoBackwardParams {
     float grad_per_pixel;
     uint valid_padding;
     uint masked;
-    uint has_sigma; // 0: the sigma partials are identically zero
 };
 
 // Chain rule through the gaussian window plus the L1 sign term (ssim.cu
 // fusedL1SSIMBackwardCUDA / maskedFusedL1SSIMBackwardCUDA). ssim_weight 1 with
-// grad_per_pixel 1/n is the pure SSIM backward for a loss of 1 - SSIM.
-kernel void photo_ssim_backward(constant PhotoBackwardParams& p [[buffer(0)]],
-                                uint2 t [[thread_position_in_threadgroup]],
-                                uint2 g [[threadgroup_position_in_grid]],
-                                uint rank [[thread_index_in_threadgroup]]) {
-    threadgroup float d0[kPhotoSpanCells], d1[kPhotoSpanCells], d2[kPhotoSpanCells];
-    threadgroup float conv[3 * kPhotoConvCells];
+// grad_per_pixel 1/n is the pure SSIM backward for a loss of 1 - SSIM. Without
+// Sigma only dm_mu is convolved: the decoupled corrected image, whose sigma
+// partials belong to the raw render.
+template <bool Sigma>
+static void photo_backward(constant PhotoBackwardParams& p, const uint2 t, const uint2 g, const uint rank,
+                           threadgroup float* d0, threadgroup float* d1, threadgroup float* d2,
+                           threadgroup float* conv) {
     const int H = p.height, W = p.width, C = p.channels;
     const uint b = g.y / p.tiles_y;
     const int y0 = int(g.y % p.tiles_y) * kPhotoTile;
@@ -559,14 +558,16 @@ kernel void photo_ssim_backward(constant PhotoBackwardParams& p [[buffer(0)]],
                     chain = (!crop_x || (gx >= 5 && gx < W - 5)) && (!crop_y || (gy >= 5 && gy < H - 5)) ? p.grad_per_pixel : 0.0f;
                 const float scale = -p.ssim_weight * chain;
                 v0 = scale * float(p.dm_mu[base + local]);
-                if (p.has_sigma != 0) {
+                if (Sigma) {
                     v1 = scale * float(p.dm_sigma1[base + local]);
                     v2 = scale * float(p.dm_sigma12[base + local]);
                 }
             }
             d0[i] = v0;
-            d1[i] = v1;
-            d2[i] = v2;
+            if (Sigma) {
+                d1[i] = v1;
+                d2[i] = v2;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -577,16 +578,20 @@ kernel void photo_ssim_backward(constant PhotoBackwardParams& p [[buffer(0)]],
                 const float w = kSsimGauss[kPhotoHalo - d];
                 const uint l = o - uint(d), r = o + uint(d);
                 a0 += (d0[l] + d0[r]) * w;
-                a1 += (d1[l] + d1[r]) * w;
-                a2 += (d2[l] + d2[r]) * w;
+                if (Sigma) {
+                    a1 += (d1[l] + d1[r]) * w;
+                    a2 += (d2[l] + d2[r]) * w;
+                }
             }
             a0 += d0[o] * kSsimGauss[kPhotoHalo];
-            a1 += d1[o] * kSsimGauss[kPhotoHalo];
-            a2 += d2[o] * kSsimGauss[kPhotoHalo];
             const uint cell = row * kPhotoTile + t.x;
             conv[cell] = a0;
-            conv[kPhotoConvCells + cell] = a1;
-            conv[2 * kPhotoConvCells + cell] = a2;
+            if (Sigma) {
+                a1 += d1[o] * kSsimGauss[kPhotoHalo];
+                a2 += d2[o] * kSsimGauss[kPhotoHalo];
+                conv[kPhotoConvCells + cell] = a1;
+                conv[2 * kPhotoConvCells + cell] = a2;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -598,13 +603,17 @@ kernel void photo_ssim_backward(constant PhotoBackwardParams& p [[buffer(0)]],
                 const uint top = (column - uint(d)) * kPhotoTile + t.x;
                 const uint bottom = (column + uint(d)) * kPhotoTile + t.x;
                 s0 += (conv[top] + conv[bottom]) * w;
-                s1 += (conv[kPhotoConvCells + top] + conv[kPhotoConvCells + bottom]) * w;
-                s2 += (conv[2 * kPhotoConvCells + top] + conv[2 * kPhotoConvCells + bottom]) * w;
+                if (Sigma) {
+                    s1 += (conv[kPhotoConvCells + top] + conv[kPhotoConvCells + bottom]) * w;
+                    s2 += (conv[2 * kPhotoConvCells + top] + conv[2 * kPhotoConvCells + bottom]) * w;
+                }
             }
             const uint mid = column * kPhotoTile + t.x;
             s0 += conv[mid] * kSsimGauss[kPhotoHalo];
-            s1 += conv[kPhotoConvCells + mid] * kSsimGauss[kPhotoHalo];
-            s2 += conv[2 * kPhotoConvCells + mid] * kSsimGauss[kPhotoHalo];
+            if (Sigma) {
+                s1 += conv[kPhotoConvCells + mid] * kSsimGauss[kPhotoHalo];
+                s2 += conv[2 * kPhotoConvCells + mid] * kSsimGauss[kPhotoHalo];
+            }
             const float p1 = p.prediction[base + pixel];
             const float p2 = photo_target(p.target, base + pixel);
             const float sign = p1 == p2 ? 0.0f : copysign(1.0f, p1 - p2);
@@ -612,6 +621,24 @@ kernel void photo_ssim_backward(constant PhotoBackwardParams& p [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+kernel void photo_ssim_backward(constant PhotoBackwardParams& p [[buffer(0)]],
+                                uint2 t [[thread_position_in_threadgroup]],
+                                uint2 g [[threadgroup_position_in_grid]],
+                                uint rank [[thread_index_in_threadgroup]]) {
+    threadgroup float d0[kPhotoSpanCells], d1[kPhotoSpanCells], d2[kPhotoSpanCells];
+    threadgroup float conv[3 * kPhotoConvCells];
+    photo_backward<true>(p, t, g, rank, d0, d1, d2, conv);
+}
+
+kernel void photo_ssim_backward_mu(constant PhotoBackwardParams& p [[buffer(0)]],
+                                   uint2 t [[thread_position_in_threadgroup]],
+                                   uint2 g [[threadgroup_position_in_grid]],
+                                   uint rank [[thread_index_in_threadgroup]]) {
+    threadgroup float d0[kPhotoSpanCells];
+    threadgroup float conv[kPhotoConvCells];
+    photo_backward<false>(p, t, g, rank, d0, d0, d0, conv);
 }
 
 struct PhotoErrorParams {
