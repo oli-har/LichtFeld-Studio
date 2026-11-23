@@ -58,29 +58,42 @@ namespace lfs::training {
 
         struct BackwardParams {
             uint64_t exposure, vignetting, color, crf, rgb_in, grad_rgb_out;
-            uint64_t grad_exposure, grad_vignetting, grad_color, grad_crf, grad_rgb_in;
+            uint64_t grad_exposure, grad_vignetting, grad_color, grad_crf, grad_rgb_in, addend;
             int32_t height, width, camera_index, frame_index;
         };
 
         // Pixels whose parameter gradients each ppisp_backward thread sums before its reductions.
         constexpr uint32_t kBackwardPixelsPerThread = 16;
 
-        // Parameter gradients accumulate, as the CUDA atomics do.
-        void backward(const PPISPInputs& p, In rgb, In grad_output, const PPISPOutputs& g, Out grad_rgb,
-                      int /*cameras*/, int /*frames*/, const int camera_index, const int frame_index) {
+        // Parameter gradients accumulate, as the CUDA atomics do. A valid addend is added to grad_rgb.
+        void backward_with(const PPISPInputs& p, In rgb, In grad_output, In addend, const PPISPOutputs& g,
+                           Out grad_rgb, const int camera_index, const int frame_index) {
             const int height = static_cast<int>(rgb.shape()[1]);
             const int width = static_cast<int>(rgb.shape()[2]);
+            if (addend.is_valid() && (addend.shape() != rgb.shape() || !addend.is_contiguous()))
+                throw std::invalid_argument(std::format("PPISP backward addend must be a contiguous {}, got {}",
+                                                        rgb.shape().str(), addend.shape().str()));
             const BackwardParams params{mk::address(p.exposure), mk::address(p.vignetting), mk::address(p.color),
                                         mk::address(p.crf), mk::address(rgb), mk::address(grad_output),
                                         mk::address(g.exposure), mk::address(g.vignetting), mk::address(g.color),
-                                        mk::address(g.crf), mk::address(grad_rgb),
+                                        mk::address(g.crf), mk::address(grad_rgb), mk::address(addend),
                                         height, width, camera_index, frame_index};
             const uint32_t groups = core::GpuKernelModule::groups_for(static_cast<size_t>(height) * width,
                                                                       mk::kGroupWidth * kBackwardPixelsPerThread);
             mk::launch("ppisp_backward", params,
                        {&p.exposure, &p.vignetting, &p.color, &p.crf, &rgb, &grad_output, &g.exposure, &g.vignetting,
-                        &g.color, &g.crf, &grad_rgb},
+                        &g.color, &g.crf, &grad_rgb, &addend},
                        groups);
+        }
+
+        void backward(const PPISPInputs& p, In rgb, In grad_output, const PPISPOutputs& g, Out grad_rgb,
+                      int /*cameras*/, int /*frames*/, const int camera_index, const int frame_index) {
+            backward_with(p, rgb, grad_output, {}, g, grad_rgb, camera_index, frame_index);
+        }
+
+        void backward_add(const PPISPInputs& p, In rgb, In grad_output, In addend, const PPISPOutputs& g,
+                          Out grad_rgb, int /*cameras*/, int /*frames*/, const int camera_index, const int frame_index) {
+            backward_with(p, rgb, grad_output, addend, g, grad_rgb, camera_index, frame_index);
         }
 
         struct AdamGroup {
@@ -238,6 +251,7 @@ namespace lfs::training {
             .vignetting_regularization = vignetting_regularization,
             .project_mean = project_mean,
             .initialize = initialize,
+            .backward_add = backward_add,
         };
         return ops;
     }

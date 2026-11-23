@@ -181,6 +181,10 @@ namespace lfs::training {
                                    int uid);
         /// Backward pass that overwrites the contiguous grad with the gradient with respect to rgb.
         void backward_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int camera_id, int uid);
+        /// backward_in_place that also adds a valid addend to that gradient in the same pass where the backend can:
+        /// returns true then, and false when the caller still has to add it.
+        bool backward_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int camera_id, int uid,
+                               const lfs::core::Tensor& addend);
 
         /// Backward pass through ISP using controller-predicted params.
         /// Returns gradient w.r.t. controller_params [1,9] for controller backward.

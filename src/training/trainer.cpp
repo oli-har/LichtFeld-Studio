@@ -8271,7 +8271,10 @@ namespace lfs::training {
                                 lfs::core::push_gpu_range("ppisp_backward");
                                 LFS_VRAM_SCOPE("train.ppisp.backward");
                                 LOG_VRAM_DIFF("train.ppisp.backward");
-                                ppisp_->backward_in_place(output.image, raster_grad, cam->camera_id(), cam->uid());
+                                // The last appearance stage: the raw-render gradient may join it in the same pass.
+                                if (ppisp_->backward_in_place(output.image, raster_grad, cam->camera_id(), cam->uid(),
+                                                              tile_grad_raw))
+                                    tile_grad_raw = {};
                                 if (ppisp_frozen) {
                                     ppisp_->zero_grad();
                                 }

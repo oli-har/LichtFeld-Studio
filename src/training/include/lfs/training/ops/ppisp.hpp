@@ -40,6 +40,11 @@ namespace lfs::gpu_ops {
         void (*initialize)(const PPISPOutputs&);
         // backward may write grad_rgb over grad_output.
         bool in_place = false;
+        // Null unless the backend has it: backward with addend added to grad_rgb in the same pass, rounded as a
+        // separate add would round it.
+        void (*backward_add)(const PPISPInputs&, In rgb, In grad_output, In addend,
+                             const PPISPOutputs& gradients, Out grad_rgb,
+                             int cameras, int frames, int camera_index, int frame_index) = nullptr;
     };
     struct ControllerOps {
         // Invalid features initializes the prior slot and waits for the copy.

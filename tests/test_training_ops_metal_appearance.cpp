@@ -761,6 +761,54 @@ namespace {
         }
     }
 
+    // actual and expected equal bit for bit; reports the number of differing values and the first one.
+    void expect_same_bits(const std::vector<float>& actual, const std::vector<float>& expected, const std::string& what) {
+        ASSERT_EQ(actual.size(), expected.size()) << what;
+        size_t differing = 0, first = 0;
+        for (size_t i = 0; i < actual.size(); ++i)
+            if (std::memcmp(&actual[i], &expected[i], sizeof(float)) != 0 && differing++ == 0)
+                first = i;
+        EXPECT_EQ(differing, 0u) << what << ": first at " << first << " actual " << actual[first] << " expected "
+                                 << expected[first];
+    }
+
+    // PPISPOps::backward_add against backward and a separate add: the image gradient bit for bit, the parameter
+    // gradients as the same sums.
+    TEST_P(PortableAppearance, PpispBackwardAddMatchesBackwardThenAdd) {
+        const auto& table = *this->table().ppisp;
+        if (table.backward_add == nullptr)
+            GTEST_SKIP() << "No PPISP backward_add on " << lfs::core::gpu_backend_name(GetParam());
+        const PpispParams p = ppisp_values();
+        constexpr int H = 37, W = 53;
+        const auto rgb = gpu(pattern(3 * H * W, 0.6f, 7, 0.45f), {3, H, W});
+        const auto grad = gpu(pattern(3 * H * W, 1.f, 9), {3, H, W});
+        const auto addend = gpu(pattern(3 * H * W, 0.7f, 13), {3, H, W});
+        const auto exposure = gpu(narrow(p.exposure), {3}), vignetting = gpu(narrow(p.vignetting), {30});
+        const auto color = gpu(narrow(p.color), {24}), crf = gpu(narrow(p.crf), {24});
+        for (const auto [camera, frame] : {std::pair{1, 2}, std::pair{-1, 0}, std::pair{0, -1}}) {
+            const std::string what = std::format("ppisp backward_add camera={} frame={}", camera, frame);
+            const auto run = [&](const bool fused) {
+                std::vector<Tensor> g{Tensor::zeros({3}, Device::GPU), Tensor::zeros({30}, Device::GPU),
+                                      Tensor::zeros({24}, Device::GPU), Tensor::zeros({24}, Device::GPU)};
+                auto out = Tensor::empty({3, H, W}, Device::GPU);
+                if (fused) {
+                    table.backward_add({exposure, vignetting, color, crf}, rgb, grad, addend, {g[0], g[1], g[2], g[3]},
+                                       out, 2, 3, camera, frame);
+                } else {
+                    table.backward({exposure, vignetting, color, crf}, rgb, grad, {g[0], g[1], g[2], g[3]}, out, 2, 3,
+                                   camera, frame);
+                    out.add_(addend);
+                }
+                g.insert(g.begin(), out);
+                return g;
+            };
+            const auto fused = run(true), sequence = run(false);
+            expect_same_bits(host(fused[0]), host(sequence[0]), what + " rgb gradient");
+            for (size_t i = 1; i < fused.size(); ++i)
+                expect_close(host(fused[i]), widen(host(sequence[i])), 1e-6, 1e-5, what + " parameter gradient");
+        }
+    }
+
     TEST_P(PortableAppearance, PpispOptimizerAndRegularizers) {
         const auto& table = *this->table().ppisp;
         {

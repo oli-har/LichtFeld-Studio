@@ -548,11 +548,19 @@ struct PpispBackwardParams {
     device float* grad_color;
     device float* grad_crf;
     device float* grad_rgb_in;
+    device const float* addend; // added to grad_rgb_in when set
     int height, width, camera_index, frame_index;
 };
 
 // Gradient slots per threadgroup: exposure, color[8], vignetting[15], CRF[12].
 constant constexpr int kPpispGradients = 36;
+
+// a + b rounded as a separate add rounds it: safe math keeps fast math from contracting the add into the product
+// that made a.
+static float3 ppisp_add(const float3 a, const float3 b) {
+#pragma METAL fp math_mode(safe)
+    return a + b;
+}
 
 // Each thread takes every threads-th pixel (about 16, as the host sizes the grid) and sums the parameter gradients
 // of its pixels in registers, so the 36 SIMD sums and the threadgroup's 36 atomics run once per thread and group
@@ -607,6 +615,8 @@ kernel void ppisp_backward(constant PpispBackwardParams& p [[buffer(0)]], uint i
             grad = ppisp_apply_exposure_bwd(rgb_input, p.exposure[p.frame_index], grad, grad_exposure);
             g[0] += grad_exposure;
         }
+        if (p.addend)
+            grad = ppisp_add(grad, float3(p.addend[pixel], p.addend[pixels + pixel], p.addend[2 * pixels + pixel]));
         p.grad_rgb_in[pixel] = grad.x;
         p.grad_rgb_in[pixels + pixel] = grad.y;
         p.grad_rgb_in[2 * pixels + pixel] = grad.z;

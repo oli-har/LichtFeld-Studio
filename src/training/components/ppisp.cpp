@@ -728,6 +728,24 @@ namespace lfs::training {
         ops.ppisp->backward({exposure_params_, vignetting_params_, color_params_, crf_params_}, rgb, grad, {exposure_grad_, vignetting_grad_, color_grad_, crf_grad_}, grad, num_cameras_, num_frames_, camera_idx, frame_idx);
     }
 
+    bool PPISP::backward_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int camera_id, int uid,
+                                  const lfs::core::Tensor& addend) {
+        const auto& ops = training_ops(lfs::core::gpu_backend_of(exposure_params_).value());
+        if (!addend.is_valid() || addend.numel() == 0 || ops.ppisp->backward_add == nullptr) {
+            backward_in_place(rgb, grad, camera_id, uid);
+            return false;
+        }
+        assert(finalized_ && "Must call finalize() before backward_in_place()");
+        const int camera_idx = translate_camera(camera_id);
+        const int frame_idx = translate_frame(uid);
+        LFS_ASSERT(rgb.shape().rank() == 3 && rgb.shape()[0] == 3 && addend.shape() == rgb.shape());
+        auto grad_rgb = ops.ppisp->in_place ? grad : lfs::core::Tensor::empty(rgb.shape(), lfs::core::Device::GPU);
+        LFS_ASSERT(grad_rgb.is_contiguous());
+        ops.ppisp->backward_add({exposure_params_, vignetting_params_, color_params_, crf_params_}, rgb, grad, addend.contiguous(), {exposure_grad_, vignetting_grad_, color_grad_, crf_grad_}, grad_rgb, num_cameras_, num_frames_, camera_idx, frame_idx);
+        grad = grad_rgb;
+        return true;
+    }
+
     lfs::core::Tensor PPISP::backward_with_controller_params(const lfs::core::Tensor& rgb,
                                                              const lfs::core::Tensor& grad_output,
                                                              const lfs::core::Tensor& controller_params,
