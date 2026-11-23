@@ -21,6 +21,7 @@
 #include <cstring>
 #include <format>
 #include <functional>
+#include <limits>
 #include <numbers>
 #include <optional>
 #include <string>
@@ -711,6 +712,52 @@ namespace {
         expect_close(host(gv), group(&PpispParams::vignetting), 2e-4, 2e-3, "ppisp vignetting gradient");
         expect_close(host(gc), group(&PpispParams::color), 2e-4, 2e-3, "ppisp color gradient");
         expect_close(host(gk), group(&PpispParams::crf), 2e-4, 2e-3, "ppisp crf gradient");
+    }
+
+    // PPISPOps::backward_add against backward and a separate add: the image gradient within float rounding, the
+    // parameter gradients as the same sums.
+    TEST_P(PortableAppearance, PpispBackwardAddMatchesBackwardThenAdd) {
+        const auto& table = *this->table().ppisp;
+        if (table.backward_add == nullptr)
+            GTEST_SKIP() << "No PPISP backward_add on " << lfs::core::gpu_backend_name(GetParam());
+        const PpispParams p = ppisp_values();
+        constexpr int H = 37, W = 53;
+        const auto rgb = gpu(pattern(3 * H * W, 0.6f, 7, 0.45f), {3, H, W});
+        const auto grad = gpu(pattern(3 * H * W, 1.f, 9), {3, H, W});
+        const auto addend = gpu(pattern(3 * H * W, 0.7f, 13), {3, H, W});
+        const auto exposure = gpu(narrow(p.exposure), {3}), vignetting = gpu(narrow(p.vignetting), {30});
+        const auto color = gpu(narrow(p.color), {24}), crf = gpu(narrow(p.crf), {24});
+        for (const auto [camera, frame] : {std::pair{1, 2}, std::pair{-1, 0}, std::pair{0, -1}}) {
+            const std::string what = std::format("ppisp backward_add camera={} frame={}", camera, frame);
+            const auto run = [&](const bool fused) {
+                std::vector<Tensor> g{Tensor::zeros({3}, Device::GPU), Tensor::zeros({30}, Device::GPU),
+                                      Tensor::zeros({24}, Device::GPU), Tensor::zeros({24}, Device::GPU)};
+                auto out = Tensor::empty({3, H, W}, Device::GPU);
+                if (fused) {
+                    table.backward_add({exposure, vignetting, color, crf}, rgb, grad, addend, {g[0], g[1], g[2], g[3]},
+                                       out, 2, 3, camera, frame);
+                } else {
+                    table.backward({exposure, vignetting, color, crf}, rgb, grad, {g[0], g[1], g[2], g[3]}, out, 2, 3,
+                                   camera, frame);
+                    out.add_(addend);
+                }
+                g.insert(g.begin(), out);
+                return g;
+            };
+            const auto fused = run(true), sequence = run(false);
+            // One kernel computes the image gradient in both runs, and each run adds the addend in one rounding, so
+            // where that add rounds as written the two agree bit for bit, as they did on an Apple M3 Ultra in all
+            // three cases. A compiler that contracted the add into the gradient's last product would move a value
+            // by at most 1.5 float epsilons of its largest operand: 4 epsilons of the largest value cover that.
+            const auto rgb_sequence = host(sequence[0]);
+            double largest = 0.0;
+            for (const float value : rgb_sequence)
+                largest = std::max(largest, static_cast<double>(std::abs(value)));
+            expect_close(host(fused[0]), widen(rgb_sequence), 4.0 * std::numeric_limits<float>::epsilon() * largest, 0.0,
+                         what + " rgb gradient");
+            for (size_t i = 1; i < fused.size(); ++i)
+                expect_close(host(fused[i]), widen(host(sequence[i])), 1e-6, 1e-5, what + " parameter gradient");
+        }
     }
 
     TEST_P(PortableAppearance, PpispOptimizerAndRegularizers) {
