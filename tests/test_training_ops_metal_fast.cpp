@@ -1706,6 +1706,82 @@ namespace {
         EXPECT_LE(worst, 1e-3 * (hi - lo) + 1e-4) << "bounds " << lo << ".." << hi;
     }
 
+    // The SH backward runs one thread per primitive when the layout's float4 slots fit one thread (degree 2 and
+    // below). With the DC and SH-rest regularizers on, over three 256-primitive blocks and two Adam steps, that must
+    // reproduce the two-thread dispatch bit for bit: SH values, packed moments, block bounds and Q16 value bounds.
+    // One pixel keeps every splat's image gradient to a single atomic add, so both runs see the same inputs; the
+    // reported regularizer losses add per-SIMD-group sums atomically and agree within float rounding.
+    TEST_P(PortableFastRaster, OneShThreadPerPrimitiveMatchesTwo) {
+        if (fast_ops().set_sh_threads_for_testing == nullptr)
+            GTEST_SKIP() << "the backend has a single SH backward dispatch";
+        constexpr size_t kSh0 = static_cast<size_t>(ops::AdamSlot::Sh0);
+        constexpr size_t kShN = static_cast<size_t>(ops::AdamSlot::ShN);
+        struct Outcome {
+            std::vector<uint8_t> sh0, shN, value_bounds;
+            std::array<std::vector<uint8_t>, 2> moments, bounds;
+            float dc_loss = 0.0f, sh_loss = 0.0f;
+        };
+        for (const int degree : {1, 2}) {
+            for (const auto storage : {ops::ShStorage::Float32, ops::ShStorage::Q16}) {
+                SCOPED_TRACE(std::format("degree {}, storage {}", degree, static_cast<int>(storage)));
+                std::vector<uint8_t> initial_shN;
+                const auto run = [&](const uint32_t threads) {
+                    Scene s = make_scene(600, degree, 1, 1, 81u + static_cast<unsigned>(degree), -2.3f, -1.6f);
+                    for (int i = 0; i < s.count; i += 7)
+                        s.sh0[3 * i] = 2.1f; // outside the DC regularizer's permitted range
+                    for (int i = 3; i < s.count; i += 11)
+                        s.sh0[3 * i + 1] = -3.0f; // below black: the regularizer gate depends on the image gradient
+                    Gpu g = upload_scene(s, storage);
+                    initial_shN = download_bytes(g.shN);
+                    const LossWeights w = random_weights(s.width, s.height, 15u, false);
+                    const Tensor grad_image = plane(w.image, 3, s.height, s.width);
+                    AdamState state;
+                    ops::BackwardAdam adam = make_adam(g, state, s.count,
+                                                       {.beta1 = 0.9f, .eps = 1e-15f, .step = 1e-3f, .bc2_sqrt_rcp = 1.0f / std::sqrt(0.001f)});
+                    adam.dc_reg_weight = 0.2f;
+                    adam.sh_rest_reg_weight = 0.5f;
+                    adam.dc_reg_loss = Tensor::zeros({1}, Device::GPU);
+                    adam.sh_rest_reg_loss = Tensor::zeros({1}, Device::GPU);
+                    Tensor none;
+                    for (int step = 0; step < 2; ++step) {
+                        Frame frame;
+                        forward(frame, s, g, {});
+                        EXPECT_EQ(frame.result.code, ops::RasterResult::Code::Success) << frame.result.message;
+                        fast_ops().set_sh_threads_for_testing(frame.saved, threads);
+                        fast_ops().backward(frame.saved, {.image = grad_image, .alpha = none, .depth = none, .normal = none},
+                                            none, none, none, none, adam, DensificationType::None);
+                    }
+                    Outcome o;
+                    o.sh0 = download_bytes(g.sh0);
+                    o.shN = download_bytes(g.shN);
+                    if (g.bounds.is_valid())
+                        o.value_bounds = download_bytes(g.bounds);
+                    for (size_t i = 0; i < 2; ++i) {
+                        o.moments[i] = download_bytes(state.moments[i == 0 ? kSh0 : kShN]);
+                        o.bounds[i] = download_bytes(state.bounds[i == 0 ? kSh0 : kShN]);
+                    }
+                    o.dc_loss = download(adam.dc_reg_loss)[0];
+                    o.sh_loss = download(adam.sh_rest_reg_loss)[0];
+                    return o;
+                };
+                const Outcome one = run(0), two = run(2);
+                EXPECT_NE(two.shN, initial_shN) << "the SH rest values must take an Adam step";
+                EXPECT_EQ(one.sh0, two.sh0);
+                EXPECT_EQ(one.shN, two.shN);
+                EXPECT_EQ(one.value_bounds, two.value_bounds);
+                for (size_t i = 0; i < 2; ++i) {
+                    SCOPED_TRACE(i == 0 ? "sh0" : "shN");
+                    EXPECT_EQ(one.moments[i], two.moments[i]);
+                    EXPECT_EQ(one.bounds[i], two.bounds[i]);
+                }
+                EXPECT_GT(two.dc_loss, 0.0f);
+                EXPECT_GT(two.sh_loss, 0.0f);
+                EXPECT_NEAR(one.dc_loss, two.dc_loss, 1e-5f * two.dc_loss);
+                EXPECT_NEAR(one.sh_loss, two.sh_loss, 1e-5f * two.sh_loss);
+            }
+        }
+    }
+
     Tensor upload_mask(const std::vector<uint8_t>& mask) {
         return Tensor::from_blob(const_cast<uint8_t*>(mask.data()), {mask.size()}, Device::CPU, DataType::Bool)
             .to(Device::GPU);

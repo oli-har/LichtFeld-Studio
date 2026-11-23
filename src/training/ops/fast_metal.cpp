@@ -37,7 +37,8 @@ namespace lfs::training {
         constexpr uint32_t kTilePixels = kTile * kTile;
         constexpr uint32_t kBlendThreads = 128;
         // kFastShParts and kFastShSlotsPerThread in fast_backward.metal:
-        // fast_backward_sh spreads a primitive's SH rest slots over kShParts threads.
+        // fast_backward_sh spreads a primitive's SH rest slots over up to
+        // kShParts threads, one when they fit kShSlotsPerThread.
         constexpr uint32_t kShParts = 2;
         constexpr uint32_t kShSlotsPerThread = 6;
         // kFastBwdThreads in fast_backward.metal.
@@ -93,6 +94,7 @@ namespace lfs::training {
             uint32_t last_instance_count = 0;
             bool defer_count = false;
             bool forced_capacity = false;
+            uint32_t sh_threads_for_testing = 0;
             Frame frame;
             std::string message;
         };
@@ -929,7 +931,11 @@ namespace lfs::training {
             LFS_ASSERT_MSG(f.sh_layout_rest <= 15 && (f.sh_layout_rest * 3 + 3) / 4 <= kShParts * kShSlotsPerThread,
                            std::format("fast_backward_sh covers 15 SH rest coefficients in {} slots, the layout has {}",
                                        kShParts * kShSlotsPerThread, f.sh_layout_rest));
-            launch("fast_backward_sh", sh, std::span<const Tensor* const>(uses), blocks, 1, 256 * kShParts,
+            // Up to degree 2 a primitive's slots fit one thread; a second one would
+            // only join the block reductions.
+            const uint32_t sh_threads = std::max(
+                (f.sh_layout_rest * 3 + 3) / 4 <= kShSlotsPerThread ? 1u : kShParts, s.sh_threads_for_testing);
+            launch("fast_backward_sh", sh, std::span<const Tensor* const>(uses), blocks, 1, 256 * sh_threads,
                    {{kShBasesConstant, f.sh_bases},
                     {kShLayoutRestConstant, f.sh_layout_rest},
                     {kShStorageConstant, f.sh_storage}});
@@ -1043,6 +1049,12 @@ namespace lfs::training {
                 throw std::logic_error("Cannot force FastGS capacity while a count is pending");
             s.instance_capacity = capacity;
             s.forced_capacity = capacity != 0;
+        }
+
+        void set_sh_threads_for_testing(lfs::gpu_ops::FastSaved& saved, const uint32_t threads) {
+            if (threads > kShParts)
+                throw std::invalid_argument(std::format("fast_backward_sh runs at most {} threads per primitive", kShParts));
+            state_of(saved).sh_threads_for_testing = threads;
         }
 
         void release_caches(lfs::gpu_ops::FastSaved& saved) noexcept {
@@ -1163,6 +1175,7 @@ namespace lfs::training {
             .set_deferred_count = set_deferred_count,
             .resolve_deferred_count = resolve_deferred_count,
             .set_instance_capacity_for_testing = set_instance_capacity_for_testing,
+            .set_sh_threads_for_testing = set_sh_threads_for_testing,
             .pop_scores = pop_scores,
         };
         return ops;

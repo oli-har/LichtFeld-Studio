@@ -174,6 +174,8 @@ namespace lfs::gpu_ops {
         void (*set_deferred_count)(FastSaved&, bool) = nullptr;
         RasterResult (*resolve_deferred_count)(FastSaved&, bool wait) = nullptr;
         void (*set_instance_capacity_for_testing)(FastSaved&, uint32_t) = nullptr;
+        // At least this many threads per primitive in the SH backward (0: the backend's choice).
+        void (*set_sh_threads_for_testing)(FastSaved&, uint32_t) = nullptr;
 
         // Adds the live forward frame's POPSpa removal energy, the sum over pixels of
         // |T * alpha * (color - color behind)|^2, into scores ([N, 8], the PopspaOps

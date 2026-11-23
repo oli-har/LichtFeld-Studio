@@ -566,9 +566,11 @@ static float4 fast_shN_slot_grad(const uint k, const bool compute, thread const 
     return g;
 }
 
-// SH rest slots per thread in fast_backward_sh: a primitive's twelve float4
-// slots spread over kFastShParts threads, so each keeps its updated moments in
-// registers between the bound reduction and the encode.
+// SH rest slots per thread in fast_backward_sh: a primitive's float4 slots
+// spread over up to kFastShParts threads, so each keeps its updated moments in
+// registers between the bound reduction and the encode. The host dispatches one
+// thread per primitive when the layout's slots fit one thread (degree 2 and
+// below), kFastShParts otherwise.
 constant constexpr uint kFastShSlotsPerThread = 6u;
 constant constexpr uint kFastShParts = kShMaxSlots / kFastShSlotsPerThread;
 
@@ -785,7 +787,8 @@ kernel void fast_backward_sh(constant FastBackwardShParams& p [[buffer(0)]],
         return;
     threadgroup float4 scratch[32];
     const FastLane t = {lane, simd_lane, simd_group, simd_groups, group};
-    // kFastShParts threads per primitive; part 0 also owns sh0 and the mean gradient.
+    // One or kFastShParts threads per primitive (the threadgroup holds 256 primitives);
+    // part 0 also owns sh0 and the mean gradient.
     const uint part = lane / uint(kJointBlock);
     const uint idx = group * uint(kJointBlock) + lane % uint(kJointBlock);
     const bool visible = idx < p.n && p.n_touched[idx] > 0u;
