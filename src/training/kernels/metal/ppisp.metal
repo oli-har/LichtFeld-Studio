@@ -507,12 +507,11 @@ struct PpispForwardParams {
     int camera_index, frame_index, x_offset, full_width;
 };
 
-kernel void ppisp_forward(constant PpispForwardParams& p [[buffer(0)]], uint index [[thread_position_in_grid]]) {
+// The forward of one pixel of rgb_in; bilateral.metal runs it inside the grid slice too.
+static float3 ppisp_forward_pixel(constant PpispForwardParams& p, const int index) {
     const int pixels = p.height * p.width;
-    if (int(index) >= pixels)
-        return;
-    const int y = int(index) / p.width;
-    const int x = int(index) % p.width;
+    const int y = index / p.width;
+    const int x = index % p.width;
     float3 rgb = float3(p.rgb_in[index], p.rgb_in[pixels + index], p.rgb_in[2 * pixels + index]);
     const float2 pixel = float2(float(p.x_offset + x) + 0.5f, float(p.y_offset + y) + 0.5f);
     if (p.frame_index != -1)
@@ -524,6 +523,14 @@ kernel void ppisp_forward(constant PpispForwardParams& p [[buffer(0)]], uint ind
         rgb = ppisp_apply_color_correction(rgb, ppisp_load_color(p.color + p.frame_index * 8));
     if (p.camera_index != -1)
         rgb = ppisp_apply_crf(rgb, p.crf + p.camera_index * 12);
+    return rgb;
+}
+
+kernel void ppisp_forward(constant PpispForwardParams& p [[buffer(0)]], uint index [[thread_position_in_grid]]) {
+    const int pixels = p.height * p.width;
+    if (int(index) >= pixels)
+        return;
+    const float3 rgb = ppisp_forward_pixel(p, int(index));
     p.rgb_out[index] = rgb.x;
     p.rgb_out[pixels + index] = rgb.y;
     p.rgb_out[2 * pixels + index] = rgb.z;
