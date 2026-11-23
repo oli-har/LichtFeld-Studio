@@ -62,6 +62,9 @@ namespace lfs::training {
             int32_t height, width, camera_index, frame_index;
         };
 
+        // Pixels whose parameter gradients each ppisp_backward thread sums before its reductions.
+        constexpr uint32_t kBackwardPixelsPerThread = 16;
+
         // Parameter gradients accumulate, as the CUDA atomics do.
         void backward(const PPISPInputs& p, In rgb, In grad_output, const PPISPOutputs& g, Out grad_rgb,
                       int /*cameras*/, int /*frames*/, const int camera_index, const int frame_index) {
@@ -72,10 +75,12 @@ namespace lfs::training {
                                         mk::address(g.exposure), mk::address(g.vignetting), mk::address(g.color),
                                         mk::address(g.crf), mk::address(grad_rgb),
                                         height, width, camera_index, frame_index};
-            mk::launch_items("ppisp_backward", params,
-                             {&p.exposure, &p.vignetting, &p.color, &p.crf, &rgb, &grad_output, &g.exposure,
-                              &g.vignetting, &g.color, &g.crf, &grad_rgb},
-                             static_cast<size_t>(height) * width);
+            const uint32_t groups = core::GpuKernelModule::groups_for(static_cast<size_t>(height) * width,
+                                                                      mk::kGroupWidth * kBackwardPixelsPerThread);
+            mk::launch("ppisp_backward", params,
+                       {&p.exposure, &p.vignetting, &p.color, &p.crf, &rgb, &grad_output, &g.exposure, &g.vignetting,
+                        &g.color, &g.crf, &grad_rgb},
+                       groups);
         }
 
         struct AdamGroup {
