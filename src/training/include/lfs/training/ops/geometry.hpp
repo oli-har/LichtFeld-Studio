@@ -64,5 +64,12 @@ namespace lfs::gpu_ops {
                             Out grad_depth, Out grad_alpha, Out loss, Out partials,
                             GeometryCamera, float weight);
         std::vector<AnchorSample> (*collect_anchor_samples)(In points, In view, In prior, const AnchorParams&);
+        // Null unless the backend has it: prior_depth (prior_normal, prior_weight) and consistency (normal,
+        // consistency_weight) on the same depth, alpha, pixel weight and camera in shared passes. Each loss has its own
+        // partials; the depth and alpha gradients receive both losses' terms, summed per pixel.
+        void (*prior_depth_and_consistency)(In prior_normal, In normal, In depth, In alpha, In pixel_weight,
+                                            Out grad_normal, Out grad_depth, Out grad_alpha, Out prior_loss,
+                                            Out prior_partials, Out consistency_loss, Out consistency_partials,
+                                            GeometryCamera, float prior_weight, float consistency_weight) = nullptr;
     };
 } // namespace lfs::gpu_ops
