@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <format>
 #include <limits>
 #include <optional>
@@ -1208,6 +1209,134 @@ namespace {
         EXPECT_EQ(cache.get(3, 8, ones, 8, 8, true), half_sum);
         cache.clear();
         EXPECT_EQ(cache.get(3, 8, ones, 8, 8, true), ones_sum) << "cleared";
+    }
+
+    // got and want equal bit for bit; reports the number of differing values and the first one.
+    void expect_same_bits(const std::vector<float>& got, const std::vector<float>& want, const std::string& what) {
+        ASSERT_EQ(got.size(), want.size()) << what;
+        size_t differing = 0, first = 0;
+        for (size_t i = 0; i < got.size(); ++i)
+            if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0 && differing++ == 0)
+                first = i;
+        EXPECT_EQ(differing, 0u) << what << ": first at " << first << " got " << got[first] << " want " << want[first];
+    }
+
+    // |got - want| <= rel * |want| for every value: each within rel of its own size, zeros exact.
+    void expect_each_relative(const std::vector<float>& got, const Field& want, const double rel,
+                              const std::string& what) {
+        ASSERT_EQ(got.size(), want.size()) << what;
+        size_t outside = 0, first = 0;
+        for (size_t i = 0; i < got.size(); ++i)
+            if (!(std::abs(got[i] - want[i]) <= rel * std::abs(want[i])) && outside++ == 0)
+                first = i;
+        EXPECT_EQ(outside, 0u) << what << ": first at " << first << " got " << got[first] << " want " << want[first];
+    }
+
+    // PhotometricOps::weighted_error_map against the trainer's sequence it replaces (map_to_error, then the mask, ROI
+    // and structure weights as separate passes) and against the same products in double on the CPU, for each kind of
+    // mask weight.
+    TEST_P(PortableLosses, WeightedErrorMapMatchesTheSequence) {
+        if (table_->photometric->weighted_error_map == nullptr)
+            GTEST_SKIP() << "No weighted_error_map on " << lfs::core::gpu_backend_name(GetParam());
+        constexpr size_t H = 37, W = 53, n = H * W;
+        const TensorShape plane({H, W});
+        // SSIM maps run past [0, 1] at the edges of their range; structure values past [0, 4].
+        const auto map_values = uniform(n, 3, -0.4f, 1.3f);
+        auto soft = uniform(n, 5);
+        for (size_t i = 0; i < n; i += 7)
+            soft[i] = i % 2 == 0 ? 0.0f : 1.0f;
+        std::vector<uint8_t> bytes(n);
+        for (size_t i = 0; i < n; ++i)
+            bytes[i] = static_cast<uint8_t>(i % 9 == 0 ? 255 - i % 4 : (i * 37) % 256);
+        const auto roi_values = uniform(n, 7, 0.1f, 1.0f);
+        const auto structure_values = uniform(n, 9, -0.5f, 5.0f);
+        // The masks' values as the weights read them: bytes as 0 to 255, bools as 0 or 1.
+        const std::vector<float> byte_values(bytes.begin(), bytes.end());
+        std::vector<float> bool_values(n);
+        for (size_t i = 0; i < n; ++i)
+            bool_values[i] = soft[i] > 0.5f ? 1.0f : 0.0f;
+
+        const Tensor map = upload(map_values, TensorShape({1, 1, H, W}));
+        const Tensor float_mask = upload(soft, plane);
+        const Tensor byte_mask = upload_bytes(bytes, plane);
+        const Tensor bool_mask = float_mask.gt(0.5f);
+        const Tensor roi = upload(roi_values, plane);
+        const Tensor structure = upload(structure_values, plane);
+
+        struct Case {
+            const char* name;
+            Tensor mask;
+            const std::vector<float>* mask_values;
+            bool keep_band;
+            float keep_min;
+            bool roi;
+            float gain;
+        };
+        const std::array<Case, 9> cases{{
+            {"no weights", {}, nullptr, false, 0.f, false, 0.f},
+            {"float mask, roi, structure", float_mask, &soft, false, 0.f, true, 1.0f},
+            {"float keep band, roi, structure", float_mask, &soft, true, k::kMaskKeepMin, true, 0.35f},
+            {"byte mask, structure", byte_mask, &byte_values, false, 0.f, false, 1.0f},
+            {"byte keep band, roi", byte_mask, &byte_values, true, 250.f, true, 0.f},
+            {"bool mask, roi, structure", bool_mask, &bool_values, false, 0.f, true, 0.35f},
+            {"bool keep band", bool_mask, &bool_values, true, 250.f, false, 0.f},
+            {"roi only", {}, nullptr, false, 0.f, true, 0.f},
+            {"structure only", {}, nullptr, false, 0.f, false, 2.5f},
+        }};
+        // Both GPU sides round the same product of float factors once per operation: the subtraction, up to three
+        // multiplies and the structure weight's multiply and add, at most six roundings of epsilon / 2. Each value so
+        // lies within 3 epsilons of the exact product, which the CPU computes in double, and within 5 of the other
+        // side (the subtraction rounds alike on both), whatever order of the multiplies or contraction of the weight
+        // a compiler picks. Each value is compared with its own size, so zeros stay exact. On an Apple M3 Ultra the
+        // map equals the sequence bit for bit in all nine cases.
+        constexpr double rel = 8.0 * std::numeric_limits<float>::epsilon();
+        for (const Case& c : cases) {
+            SCOPED_TRACE(c.name);
+            Field reference(n);
+            for (size_t i = 0; i < n; ++i) {
+                double weight = 1.0;
+                if (c.mask_values != nullptr) {
+                    const float value = (*c.mask_values)[i];
+                    weight = c.keep_band ? (value > c.keep_min ? 1.0 : 0.0) : value;
+                }
+                if (c.roi)
+                    weight *= roi_values[i];
+                if (c.gain > 0.f)
+                    weight *= 1.0 + c.gain * std::clamp(static_cast<double>(structure_values[i]), 0.0, 4.0);
+                reference[i] = std::max(1.0 - map_values[i], 0.0) * weight;
+            }
+
+            // The trainer's sequence, in place on a copy of the map.
+            Tensor sequence_map = map.clone();
+            Tensor sequence = sequence_map.reshape({static_cast<int>(H), static_cast<int>(W)});
+            table_->photometric->map_to_error(sequence_map, sequence);
+            if (c.keep_band)
+                sequence.mul_(c.mask.gt(c.keep_min).to(DataType::Float32));
+            else if (c.mask.is_valid())
+                sequence.mul_(c.mask.dtype() == DataType::Float32 ? c.mask : c.mask.to(DataType::Float32));
+            if (c.roi)
+                sequence.mul_(roi);
+            if (c.gain > 0.f)
+                k::structure_densification_weight(sequence, structure, c.gain);
+
+            const ops::ErrorMapWeights weights{.mask = c.mask,
+                                               .mask_keep_band = c.keep_band,
+                                               .mask_keep_min = c.keep_min,
+                                               .roi = c.roi ? roi : Tensor{},
+                                               .structure = structure,
+                                               .structure_gain = c.gain};
+            // In place, as the trainer calls it, and into a separate map: one kernel on the same values, so the two
+            // agree bit for bit.
+            Tensor fused_map = map.clone();
+            Tensor fused = fused_map.reshape({static_cast<int>(H), static_cast<int>(W)});
+            table_->photometric->weighted_error_map(fused_map, fused, weights);
+            Tensor separate = Tensor::empty(plane, Device::GPU);
+            table_->photometric->weighted_error_map(map, separate, weights);
+            const auto fused_values = download(fused);
+            expect_same_bits(download(separate), fused_values, "separate against in place");
+            expect_each_relative(fused_values, reference, rel, "against the CPU");
+            expect_each_relative(fused_values, widen(download(sequence)), rel, "against the sequence");
+        }
     }
 
     INSTANTIATE_TEST_SUITE_P(Backends, PortableLosses, testing::Values(GpuBackend::Metal, GpuBackend::Vulkan),

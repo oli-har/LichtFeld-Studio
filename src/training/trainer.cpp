@@ -7792,7 +7792,11 @@ namespace lfs::training {
 
                         merge_depth_grad_buffers();
 
-                        // 2) Extract error map from workspace's ssim_map
+                        // 2) Extract error map from workspace's ssim_map, then weight it by the mask, the ROI pixel
+                        // weights and the thin-structure gain, in this order. A backend with weighted_error_map does
+                        // both in one pass over a one-channel SSIM map.
+                        lfs::core::Tensor unweighted_error_map;
+                        lfs::gpu_ops::ErrorMapWeights error_weights;
                         if (use_pixel_error_densification) {
                             LFS_VRAM_SCOPE("train.densification_error_map");
                             LOG_VRAM_DIFF("train.densification_error_map");
@@ -7809,7 +7813,10 @@ namespace lfs::training {
                                     const size_t H = densify_src.shape()[2];
                                     const size_t W = densify_src.shape()[3];
                                     tile_error_map = densify_src.reshape({static_cast<int>(H), static_cast<int>(W)});
-                                    training_ops_->photometric->map_to_error(densify_src, tile_error_map);
+                                    if (training_ops_->photometric->weighted_error_map != nullptr)
+                                        unweighted_error_map = densify_src;
+                                    else
+                                        training_ops_->photometric->map_to_error(densify_src, tile_error_map);
                                 } else {
                                     const size_t H = densify_src.shape()[2];
                                     const size_t W = densify_src.shape()[3];
@@ -7857,25 +7864,19 @@ namespace lfs::training {
                                 step_params.mask_mode == lfs::core::param::MaskMode::SegmentAndIgnore) {
                                 // The pipelined loader returns normalized Float32 masks;
                                 // Camera masks retain their raw UInt8 band levels.
-                                const float keep_min =
+                                error_weights.mask = mask_tile;
+                                error_weights.mask_keep_band = true;
+                                error_weights.mask_keep_min =
                                     (mask_tile.dtype() == lfs::core::DataType::UInt8 ||
                                      mask_tile.dtype() == lfs::core::DataType::Bool)
                                         ? 250.0f
                                         : lfs::training::kernels::kMaskKeepMin;
-                                const auto mask_for_error =
-                                    mask_tile.gt(keep_min).to(lfs::core::DataType::Float32);
-                                tile_error_map.mul_(mask_for_error);
                             }
 
                             if (use_mask &&
                                 (step_params.mask_mode == lfs::core::param::MaskMode::Segment ||
                                  step_params.mask_mode == lfs::core::param::MaskMode::Ignore)) {
-                                const auto mask_for_error =
-                                    (mask_tile.dtype() == lfs::core::DataType::UInt8 ||
-                                     mask_tile.dtype() == lfs::core::DataType::Bool)
-                                        ? mask_tile.to(lfs::core::DataType::Float32)
-                                        : mask_tile;
-                                tile_error_map.mul_(mask_for_error);
+                                error_weights.mask = mask_tile;
                             }
                         }
 
@@ -7883,17 +7884,38 @@ namespace lfs::training {
                         // box is seen, including the background behind it, not where pixels are ignored.
                         if (tile_error_map.is_valid() && roi_weight.is_valid() &&
                             tile_error_map.numel() == roi_weight.numel()) {
-                            tile_error_map.mul_(roi_weight.reshape(tile_error_map.shape()));
+                            error_weights.roi = roi_weight.reshape(tile_error_map.shape());
                         }
 
                         if (tile_error_map.is_valid() && params_.optimization.densify_structure_weight > 0.0f) {
-                            const auto structure_map = get_thin_structure_map(
+                            error_weights.structure = get_thin_structure_map(
                                 cam->uid(), stable_gt, params_.optimization.densify_structure_weight,
                                 use_mask && params_.optimization.mask_mode != lfs::core::param::MaskMode::AlphaConsistent
                                     ? mask_tile
                                     : lfs::core::Tensor{});
-                            kernels::structure_densification_weight(tile_error_map, structure_map,
-                                                                    params_.optimization.densify_structure_weight);
+                            error_weights.structure_gain = params_.optimization.densify_structure_weight;
+                        }
+
+                        if (unweighted_error_map.is_valid()) {
+                            LFS_VRAM_SCOPE("train.densification_error_map");
+                            training_ops_->photometric->weighted_error_map(unweighted_error_map, tile_error_map,
+                                                                           error_weights);
+                        } else if (tile_error_map.is_valid()) {
+                            LFS_VRAM_SCOPE("train.densification_error_map");
+                            const auto& mask = error_weights.mask;
+                            if (error_weights.mask_keep_band) {
+                                tile_error_map.mul_(mask.gt(error_weights.mask_keep_min).to(lfs::core::DataType::Float32));
+                            } else if (mask.is_valid()) {
+                                tile_error_map.mul_((mask.dtype() == lfs::core::DataType::UInt8 ||
+                                                     mask.dtype() == lfs::core::DataType::Bool)
+                                                        ? mask.to(lfs::core::DataType::Float32)
+                                                        : mask);
+                            }
+                            if (error_weights.roi.is_valid())
+                                tile_error_map.mul_(error_weights.roi);
+                            if (error_weights.structure.is_valid())
+                                kernels::structure_densification_weight(tile_error_map, error_weights.structure,
+                                                                        error_weights.structure_gain);
                         }
 
                         if (tile_error_map.is_valid() && core::param::is_mrnf_strategy(step_params.strategy)) {

@@ -630,3 +630,36 @@ kernel void photo_map_to_error(constant PhotoErrorParams& p [[buffer(0)]], uint 
         sum += p.map[c * p.plane + index];
     p.error[index] = fmax(1.0f - sum * (1.0f / float(p.channels)), 0.0f);
 }
+
+struct PhotoWeightedErrorParams {
+    device const float* map;
+    device float* error;
+    device const uchar* mask; // Float32, or one byte per pixel
+    device const float* roi;
+    device const float* structure;
+    uint plane, mask_bytes, mask_keep_band;
+    float mask_keep_min, structure_gain;
+};
+
+// The weighted error of one pixel. Safe math rounds each product on its own and in the order of the passes it
+// replaces (map_to_error, the mask and ROI multiplies, the structure weight); fast math would reassociate the chain.
+static float photo_weighted_error(const float map, const float mask, const float roi, const float structure) {
+#pragma METAL fp math_mode(safe)
+    return fmax(1.0f - map, 0.0f) * mask * roi * structure;
+}
+
+// photo_map_to_error of a one-channel map times the ErrorMapWeights; absent weights are 1. map may alias error.
+kernel void photo_weighted_error_map(constant PhotoWeightedErrorParams& p [[buffer(0)]],
+                                     uint index [[thread_position_in_grid]]) {
+    if (index >= p.plane)
+        return;
+    float mask = 1.0f;
+    if (p.mask) {
+        const float value = p.mask_bytes != 0 ? float(p.mask[index]) : ((device const float*)p.mask)[index];
+        mask = p.mask_keep_band != 0 ? (value > p.mask_keep_min ? 1.0f : 0.0f) : value;
+    }
+    const float roi = p.roi ? p.roi[index] : 1.0f;
+    // As structure_main's operation 5 computes it.
+    const float structure = p.structure ? 1.0f + p.structure_gain * clamp(p.structure[index], 0.0f, 4.0f) : 1.0f;
+    p.error[index] = photo_weighted_error(p.map[index], mask, roi, structure);
+}

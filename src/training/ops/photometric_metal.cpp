@@ -567,7 +567,8 @@ namespace lfs::training {
                          kLossNone, false, 1.f, false, contrast_structure_only);
         }
 
-        void photo_map_to_error(const Tensor& map, Tensor& error) {
+        // Pixels of a [1,C,H,W] map and its [H,W] error map.
+        size_t error_map_plane(const Tensor& map, const Tensor& error) {
             LFS_ASSERT_MSG(map.is_valid() && map.device() == Device::GPU && map.dtype() == DataType::Float32 &&
                                map.is_contiguous() && map.ndim() == 4 && map.shape()[0] == 1 && map.shape()[1] > 0 &&
                                map.shape()[2] > 0 && map.shape()[3] > 0,
@@ -577,12 +578,60 @@ namespace lfs::training {
                                error.is_contiguous() && error.ndim() == 2 && error.shape()[0] == h && error.shape()[1] == w,
                            std::format("SSIM error map must be contiguous Float32 GPU [H,W] (map={}, expected=[{}, {}])",
                                        error.shape().str(), h, w));
+            LFS_ASSERT_MSG(h * w <= UINT32_MAX, std::format("SSIM error maps support at most 2^32-1 pixels (shape={})",
+                                                            map.shape().str()));
+            return h * w;
+        }
+
+        void photo_map_to_error(const Tensor& map, Tensor& error) {
+            const size_t plane = error_map_plane(map, error);
             struct {
                 uint64_t map, error;
                 uint32_t plane, channels;
-            } const params{mk::address(map), mk::address(error), static_cast<uint32_t>(h * w),
+            } const params{mk::address(map), mk::address(error), static_cast<uint32_t>(plane),
                            static_cast<uint32_t>(map.shape()[1])};
-            mk::launch_items("photo_map_to_error", params, {&map, &error}, h * w);
+            mk::launch_items("photo_map_to_error", params, {&map, &error}, plane);
+        }
+
+        // A weight of the error map: a contiguous GPU tensor of `plane` elements of one of `dtypes`.
+        Tensor error_weight(const Tensor& weight, const size_t plane, const std::initializer_list<DataType> dtypes,
+                            const std::string_view name) {
+            if (!weight.is_valid())
+                return {};
+            LFS_ASSERT_MSG(weight.device() == Device::GPU && weight.numel() == plane &&
+                               std::find(dtypes.begin(), dtypes.end(), weight.dtype()) != dtypes.end(),
+                           std::format("Error map {} must be a GPU tensor of {} pixels (shape={}, dtype={})", name, plane,
+                                       weight.shape().str(), static_cast<int>(weight.dtype())));
+            return weight.contiguous();
+        }
+
+        void photo_weighted_error_map(const Tensor& map, Tensor& error, const lfs::gpu_ops::ErrorMapWeights& weights) {
+            const size_t plane = error_map_plane(map, error);
+            LFS_ASSERT_MSG(map.shape()[1] == 1, std::format("Weighted error maps take a one-channel map (shape={})",
+                                                            map.shape().str()));
+            LFS_ASSERT_MSG(std::isfinite(weights.structure_gain) && weights.structure_gain >= 0.0f,
+                           std::format("Structure gain must be finite and non-negative (gain={})", weights.structure_gain));
+            const Tensor mask = error_weight(weights.mask, plane, {DataType::Float32, DataType::UInt8, DataType::Bool}, "mask");
+            const Tensor roi = error_weight(weights.roi, plane, {DataType::Float32}, "ROI weights");
+            // A zero gain leaves the map as it is, as structure_densification_weight does.
+            const Tensor structure = weights.structure_gain > 0.0f
+                                         ? error_weight(weights.structure, plane, {DataType::Float32}, "structure map")
+                                         : Tensor{};
+            struct {
+                uint64_t map, error, mask, roi, structure;
+                uint32_t plane, mask_bytes, mask_keep_band;
+                float mask_keep_min, structure_gain;
+            } const params{mk::address(map),
+                           mk::address(error),
+                           mk::address(mask),
+                           mk::address(roi),
+                           mk::address(structure),
+                           static_cast<uint32_t>(plane),
+                           mask.is_valid() && mask.dtype() != DataType::Float32 ? 1u : 0u,
+                           weights.mask_keep_band ? 1u : 0u,
+                           weights.mask_keep_min,
+                           weights.structure_gain};
+            mk::launch_items("photo_weighted_error_map", params, {&map, &error, &mask, &roi, &structure}, plane);
         }
 
         size_t reserved_bytes(const Tensor& tensor) {
@@ -629,6 +678,7 @@ namespace lfs::training {
             .workspace_bytes = photo_workspace_bytes,
             .shrink_to_required = photo_shrink_to_required,
             .reset = photo_reset,
+            .weighted_error_map = photo_weighted_error_map,
         };
         return ops;
     }
