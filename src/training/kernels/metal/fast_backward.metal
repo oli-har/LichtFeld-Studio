@@ -337,7 +337,11 @@ kernel void fast_blend_backward(constant FastBlendBackwardParams& p [[buffer(0)]
             const float h_dx = dx * sums.x;
             const float2 grad_mean = float2(co.x * h_dx + co.y * sums.y, co.y * h_dx + co.z * sums.y);
             const float3 grad_conic = 0.5f * float3(dx * h_dx, dx * sums.y, sums.z);
-            if (!simd_any(contributed))
+            // A pixel that took part left its weight alpha * T in the peak, and that weight is positive: alpha is at
+            // least kFastMinAlpha, and T at least the pixel's final transmittance, which the forward leaves at
+            // 1e-4 * (1 - kFastMaxFragmentAlpha) or more. So with the peak kept, the peak tells whether any pixel
+            // took part, and the walk keeps no register for the flag.
+            if (!simd_any(kFastBlendPeak != 0u ? a.blend_peak > 0.0f : contributed))
                 continue;
             if (kFastImpactScore != 0u) {
                 const float impact_sum = simd_sum(a.impact_sum);
