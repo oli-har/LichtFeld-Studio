@@ -232,6 +232,8 @@ struct MrnfDecayParams {
     float scale_decay;
     float train_t;
     device const float* rendered_count;
+    // Optional [N] keep-covered factors.
+    device const float* reach;
 };
 
 kernel void mrnf_decay(constant MrnfDecayParams& p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
@@ -240,12 +242,18 @@ kernel void mrnf_decay(constant MrnfDecayParams& p [[buffer(0)]], uint i [[threa
     float opacity_decay = p.opacity_decay;
     float scale_decay = p.scale_decay;
 
-    const float t_shrink = 1.0f - p.train_t;
+    // Both decays scale by the row's reach (1 without one); reach 1 gives exactly the plain decay.
+    float reach = 1.0f;
+    if (p.reach != nullptr)
+        reach = mrnf_is_nan(p.reach[i]) ? 0.0f : fmin(fmax(p.reach[i], 0.0f), 1.0f);
+    const float t_shrink = (1.0f - p.train_t) * reach;
     const float opacity_delta = opacity_decay * t_shrink;
     const float raw = p.raw_opacity[i];
     if ((p.rendered_count == nullptr || p.rendered_count[i] > 0.0f) &&
         (opacity_delta != 0.0f || mrnf_is_inf(raw)))
         p.raw_opacity[i] = mrnf_logit(mrnf_sigmoid(raw) - opacity_delta);
+    if (!(reach > 0.0f))
+        return; // no reach: the scale stays as it is
     const float factor = 1.0f - scale_decay * t_shrink;
     for (uint d = 0; d < 3; ++d) {
         const float scale = exp(p.log_scales[i * 3 + d]) * factor;

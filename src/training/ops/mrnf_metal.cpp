@@ -102,7 +102,7 @@ namespace lfs::training {
             uint64_t raw_opacity, log_scales, frozen;
             uint32_t frozen_count, count;
             float opacity_decay, scale_decay, train_t;
-            uint64_t rendered_count;
+            uint64_t rendered_count, reach;
         };
 
         void decay(Tensor& raw_opacity, Tensor& log_scales, const Tensor& frozen,
@@ -110,11 +110,16 @@ namespace lfs::training {
             const size_t n = log_scales.shape()[0];
             if (n == 0)
                 return;
+            if (p.reach.is_valid() &&
+                (p.reach.dtype() != core::DataType::Float32 || p.reach.numel() < n || !p.reach.is_contiguous()))
+                throw std::invalid_argument(std::format("MRNF decay reach needs {} contiguous float values, got {}", n,
+                                                        p.reach.numel()));
             const DecayKernelParams params{mk::address(raw_opacity), mk::address(log_scales), mk::address(frozen),
                                            optional_count(frozen),
                                            count32(n, "MRNF decay"), p.opacity_decay, p.scale_decay,
-                                           p.train_t, mk::address(p.rendered_count)};
-            mk::launch_items("mrnf_decay", params, {&raw_opacity, &log_scales, &frozen, &p.rendered_count}, n);
+                                           p.train_t, mk::address(p.rendered_count), mk::address(p.reach)};
+            mk::launch_items("mrnf_decay", params,
+                             {&raw_opacity, &log_scales, &frozen, &p.rendered_count, &p.reach}, n);
         }
 
         Bounds percentile_bounds(const Tensor& means, const float percentile) {
