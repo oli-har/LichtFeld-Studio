@@ -26,6 +26,8 @@ struct RefineSplitParams {
     device float* child_opacity;
     device const long* indices;
     uint count;
+    // 0: the ordinary split. > 0: the conserving split at the cap (see refine_split).
+    float conserve_axis_scale;
 };
 
 // Long-axis split: the parent moves half its long axis forward in place,
@@ -50,12 +52,30 @@ kernel void refine_split(constant RefineSplitParams& p [[buffer(0)]], uint i [[t
     const uint3 axes = refine_axis_order(scale);
     const float offset_magnitude = exp(scale[axes.x]) * 0.5f;
     float3 new_scale;
-    new_scale[axes.x] = scale[axes.x] + as_type<float>(0xbf317218u); // logf(0.5f)
-    new_scale[axes.y] = scale[axes.y] + as_type<float>(0xbe266b5bu); // logf(0.85f)
-    new_scale[axes.z] = scale[axes.z] + as_type<float>(0xbe266b5bu);
-    const float sig = 1.0f / (1.0f + exp(-p.opacity[src]));
-    const float raw_sig = fmax(1e-7f, fmin(1.0f - 1e-7f, sig * 0.6f));
-    const float new_opacity = log(raw_sig / (1.0f - raw_sig));
+    float new_opacity;
+    if (p.conserve_axis_scale > 0.0f) {
+        // The longest and the smallest axis times the factor, the middle one kept. Each child gets
+        // 1 - sqrt(1 - o), so the two composite back to the parent's opacity o. In logits, with
+        // s = sqrt(1 - o): logit(child) = log o - log1p(s) - log s, where log o = -softplus(-x) and
+        // log s = -softplus(x) / 2.
+        const uint smallest = scale[axes.y] <= scale[axes.z] ? axes.y : axes.z;
+        const uint middle = smallest == axes.y ? axes.z : axes.y;
+        const float log_f = log(p.conserve_axis_scale);
+        new_scale[axes.x] = scale[axes.x] + log_f;
+        new_scale[middle] = scale[middle];
+        new_scale[smallest] = scale[smallest] + log_f;
+        const float x = p.opacity[src];
+        const float tail = log(1.0f + exp(-fabs(x)));
+        const float log_s = -0.5f * (fmax(x, 0.0f) + tail);
+        new_opacity = -(fmax(-x, 0.0f) + tail) - log(1.0f + exp(log_s)) - log_s;
+    } else {
+        new_scale[axes.x] = scale[axes.x] + as_type<float>(0xbf317218u); // logf(0.5f)
+        new_scale[axes.y] = scale[axes.y] + as_type<float>(0xbe266b5bu); // logf(0.85f)
+        new_scale[axes.z] = scale[axes.z] + as_type<float>(0xbe266b5bu);
+        const float sig = 1.0f / (1.0f + exp(-p.opacity[src]));
+        const float raw_sig = fmax(1e-7f, fmin(1.0f - 1e-7f, sig * 0.6f));
+        new_opacity = log(raw_sig / (1.0f - raw_sig));
+    }
     const float3 offset = column[axes.x] * offset_magnitude;
 
     for (uint d = 0; d < 3; ++d) {
