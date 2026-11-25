@@ -129,6 +129,7 @@ set(TRAINING_NEW_SOURCES
     losses/effective_rank_regularization.cpp
     ops/popspa.cpp
     ops/calibration_portable.cpp
+    ops/mrnf_growth_portable.cpp
     losses/mask_loss.cpp
     strategies/strategy_utils.cpp
     strategies/postprocess_compaction.cpp
@@ -283,6 +284,7 @@ target_link_libraries(lfs_training PRIVATE lfs_geometry_camera lfs_roi_masks)
 lfs_add_gpu_program(lfs_training ray_depth_program SOURCE ops/ray_depth.slang COMPUTE propose commit)
 lfs_add_gpu_program(lfs_training popspa_program SOURCE ops/popspa.slang COMPUTE fold split shifted proxy penalty effective_rank export_float64)
 lfs_add_gpu_program(lfs_training calibration_program SOURCE ops/calibration.slang COMPUTE resample accumulate update clear_outside follow)
+lfs_add_gpu_program(lfs_training mrnf_growth_program SOURCE ops/mrnf_growth.slang COMPUTE fold_view mean_view fold_need blend_peak covered_factor retire_key)
 
 target_include_directories(lfs_training
     PUBLIC

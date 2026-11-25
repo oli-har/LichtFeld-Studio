@@ -275,6 +275,7 @@ namespace lfs::training {
             .replace_parent_weights = replace_parent_weights,
             .kth_largest = portable_mrnf_kth_largest,
             .rank_exchange_rows = portable_mrnf_rank_exchange_rows,
+            .growth = &portable_mrnf_growth_ops(),
         };
         return ops;
     }
