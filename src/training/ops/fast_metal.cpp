@@ -60,6 +60,7 @@ namespace lfs::training {
         constexpr uint32_t kDepthGradConstant = 68;
         constexpr uint32_t kEdgeWeightConstant = 69;
         constexpr uint32_t kImpactScoreConstant = 70;
+        constexpr uint32_t kBlendPeakConstant = 71;
 
         // Tensors captured by forward for the backward of the same frame.
         struct Frame {
@@ -695,6 +696,8 @@ namespace lfs::training {
             uint64_t rendered_count, erank_loss, mean_far;
             float scale_normalizer, erank_weight, mean_median;
             uint32_t per_splat_mean_step;
+            uint64_t blend_peak;
+            uint32_t reg_rendered_only;
         };
 
         // A read-only per-pixel map given as [H, W] or [1, H, W], made contiguous.
@@ -758,7 +761,7 @@ namespace lfs::training {
                    {&s.counts, &s.ranges, &s.values[f.sorted], &s.coverage, &s.mean_box, &s.conic_opacity, &s.color_depth,
                     &color, &image, &s.n_contrib, &s.final_transmittance, &scratch},
                    f.grid_w * f.grid_h, 1, kBackwardThreads,
-                   {{kDensificationConstant, 0}, {kNormalChannelConstant, 0}, {kDepthGradConstant, 0}, {kEdgeWeightConstant, 0}, {kImpactScoreConstant, 2}});
+                   {{kDensificationConstant, 0}, {kNormalChannelConstant, 0}, {kDepthGradConstant, 0}, {kEdgeWeightConstant, 0}, {kImpactScoreConstant, 2}, {kBlendPeakConstant, 0}});
             accumulate_pop_view_scores(scores, scratch);
         }
 
@@ -796,6 +799,13 @@ namespace lfs::training {
                            !adam.impact_sum.is_contiguous() || !adam.impact_peak.is_contiguous()))
                 throw std::invalid_argument(std::format("impact outputs need {} contiguous float values, got {} and {}", f.n,
                                                         adam.impact_sum.numel(), adam.impact_peak.numel()));
+            const bool blend_peak_row = present(adam.blend_peak);
+            if (blend_peak_row && (adam.blend_peak.dtype() != DataType::Float32 || adam.blend_peak.numel() < f.n ||
+                                   !adam.blend_peak.is_contiguous()))
+                throw std::invalid_argument(std::format("the blend peak needs {} contiguous float values, got {}", f.n,
+                                                        adam.blend_peak.numel()));
+            // Rendered-only regularizers read the peak as "the splat contributed", so the blend keeps it for them too.
+            const uint32_t blend_peak = blend_peak_row || adam.reg_rendered_only ? 1u : 0u;
 
             const bool update_densification = densification.is_valid() && densification.ndim() == 2 &&
                                               densification.shape()[1] >= f.n;
@@ -884,7 +894,8 @@ namespace lfs::training {
                         {kNormalChannelConstant, normal_channel ? 1u : 0u},
                         {kDepthGradConstant, present(grad_depth) ? 1u : 0u},
                         {kEdgeWeightConstant, present(edge_weight) && present(edge_scores) ? 1u : 0u},
-                        {kImpactScoreConstant, impact ? 1u : 0u}});
+                        {kImpactScoreConstant, impact ? 1u : 0u},
+                        {kBlendPeakConstant, blend_peak}});
             }
 
             const uint32_t blocks = div_up(f.n, 256);
@@ -936,7 +947,7 @@ namespace lfs::training {
                 uses.push_back(&adam.scale_reg_loss);
             if (opacity_loss)
                 uses.push_back(&adam.opacity_reg_loss);
-            for (const Tensor* tensor : {&adam.rendered_count, &adam.erank_reg_loss, &adam.mean_step_far_mask})
+            for (const Tensor* tensor : {&adam.rendered_count, &adam.erank_reg_loss, &adam.mean_step_far_mask, &adam.blend_peak})
                 if (present(*tensor))
                     uses.push_back(tensor);
             const BackwardGeometryParams geometry{
@@ -983,10 +994,11 @@ namespace lfs::training {
                 .erank_weight = adam.erank_reg_weight,
                 .mean_median = adam.mean_step_median_extent,
                 .per_splat_mean_step = adam.per_splat_mean_step,
-
+                .blend_peak = blend_peak_row ? mk::address(adam.blend_peak) : 0,
+                .reg_rendered_only = adam.reg_rendered_only ? 1u : 0u,
             };
             launch("fast_backward_geometry", geometry, std::span<const Tensor* const>(uses), blocks, 1, 256,
-                   {{kMipFilterConstant, f.mip_filter ? 1u : 0u}});
+                   {{kMipFilterConstant, f.mip_filter ? 1u : 0u}, {kBlendPeakConstant, blend_peak}});
         }
 
         void release(lfs::gpu_ops::FastSaved& saved) noexcept {

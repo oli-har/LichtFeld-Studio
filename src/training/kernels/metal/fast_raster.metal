@@ -23,7 +23,7 @@ constant constexpr float kFastDilation = 0.3f;
 constant constexpr float kFastDilationMip = 0.1f;
 constant constexpr uint kFastInvalid = 0xffffffffu;
 
-// Function constants of this family use indices 60..70.
+// Function constants of this family use indices 60..71.
 constant uint kFastShBases [[function_constant(60)]];
 constant uint kFastRenderDepth [[function_constant(61)]];
 constant uint kFastRenderNormal [[function_constant(62)]];
@@ -38,6 +38,9 @@ constant uint kFastEdgeWeight [[function_constant(69)]];
 // Backward only: whether the blend writes per-splat removal impact (sum and peak).
 // 0: no scoring, 1: summed/peak L1 removal impact, 2: squared RGB POP energy only.
 constant uint kFastImpactScore [[function_constant(70)]];
+// Backward only: whether the blend keeps each splat's largest blend weight alpha * T of the view
+// (blend_backward_cu's BLEND_PEAK), which the geometry pass reads.
+constant uint kFastBlendPeak [[function_constant(71)]];
 
 // Screen mean plus the conservative pixel AABB [x0, x1) x [y0, y1) of the
 // contribution ellipse.
