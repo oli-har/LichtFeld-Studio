@@ -488,6 +488,140 @@ namespace {
         }
     }
 
+    // A row's reach (mrnf_retire_kernels.cu).
+    float row_reach(const float peak, const float raw_opacity) {
+        const float opacity = std::max(1.0f / (1.0f + std::exp(-raw_opacity)), 1e-6f);
+        return peak >= opacity ? 1.0f : std::clamp(peak / opacity, 0.0f, 1.0f);
+    }
+
+    // MRNF's growth operations against transliterations of mrnf_growth_kernels.cu, mrnf_retire_kernels.cu and
+    // the stable radix sort of lowest_eligible_keys (mrnf_kernels.cu).
+    TEST_P(PortableDensifyOps, MrnfGrowthOpsMatchReference) {
+        ASSERT_NE(mrnf().growth, nullptr) << "MrnfGrowthOps missing";
+        const auto& growth = *mrnf().growth;
+        constexpr size_t n = 2063;
+
+        // fold_view: one view's coverage (row 0) and error sum (row 1) into the window, with and without the
+        // per-splat view counts.
+        auto info = values(4 * n, 1.2f, 21, 0.4f);
+        for (size_t i = 0; i < n; i += 9)
+            info[i] = info[n + i] = 0.0f;
+        const auto error0 = unit_values(n);
+        const auto views0 = values(n, 1.0f, 5, 1.0f);
+        for (const bool with_views : {true, false}) {
+            SCOPED_TRACE(with_views ? "with views" : "without views");
+            auto expected_error = error0;
+            auto expected_info = info;
+            auto expected_views = views0;
+            for (size_t i = 0; i < n; ++i) {
+                const float coverage = info[i], value = info[n + i];
+                if (with_views && coverage > 0.0f)
+                    expected_views[i] += 1.0f;
+                const float compressed = value > 0.0f ? std::pow(value, 0.2f) : 0.0f;
+                expected_error[i] += compressed;
+                if (compressed > 0.0f)
+                    expected_info[3 * n + i] += 1.0f;
+                expected_info[2 * n + i] += coverage;
+                expected_info[i] = expected_info[n + i] = 0.0f;
+            }
+            auto error_gpu = gpu(error0);
+            auto info_gpu = gpu_rows(info, n);
+            auto views_gpu = with_views ? gpu(views0) : Tensor();
+            growth.fold_view(error_gpu, info_gpu, views_gpu);
+            expect_close(host_f(error_gpu), expected_error, "growth.fold_view.error");
+            expect_same(host_f(info_gpu), expected_info, "growth.fold_view.info");
+            if (with_views)
+                expect_same(host_f(views_gpu), expected_views, "growth.fold_view.views");
+            if (!with_views)
+                continue;
+
+            // mean_view, then fold_need, on the folded window.
+            auto mean = expected_error;
+            for (size_t i = 0; i < n; ++i)
+                mean[i] /= std::max(expected_info[3 * n + i], 1.0f);
+            growth.mean_view(error_gpu, info_gpu);
+            expect_close(host_f(error_gpu), mean, "growth.mean_view");
+            auto need = mean;
+            for (auto& e : need)
+                e = e > 0.0f ? std::pow(std::min(e / 0.3f, 2.5f), 0.7f) : 0.0f;
+            growth.fold_need(error_gpu, 0.3f, 2.5f, 0.7f);
+            expect_close(host_f(error_gpu), need, "growth.fold_need");
+        }
+
+        // blend_peak: the step's peak into the running peak, a render where the step saw the splat.
+        const auto step = values(n, 0.07f, 6, 0.03f);
+        const auto peak0 = unit_values(n);
+        std::vector<float> renders0(n);
+        for (size_t i = 0; i < n; ++i)
+            renders0[i] = static_cast<float>(27 + i % 7);
+        auto expected_peak = peak0, expected_renders = renders0;
+        for (size_t i = 0; i < n; ++i) {
+            if (step[i] > 0.0f)
+                expected_renders[i] += 1.0f;
+            expected_peak[i] = std::max(peak0[i] * 0.975f, step[i]);
+        }
+        auto step_gpu = gpu(step), peak_gpu = gpu(peak0), renders_gpu = gpu(renders0);
+        growth.blend_peak(step_gpu, peak_gpu, renders_gpu, 0.975f);
+        expect_same(host_f(step_gpu), std::vector<float>(n, 0.0f), "growth.blend_peak.step");
+        expect_same(host_f(renders_gpu), expected_renders, "growth.blend_peak.renders");
+        expect_close(host_f(peak_gpu), expected_peak, "growth.blend_peak.peak");
+
+        // covered_factor and retire_key on the folded peak.
+        const auto logits = values(n, 7.0f, 7, -1.0f);
+        const auto scales = values(3 * n, 3.0f, 8, -2.0f);
+        std::vector<float> expected_factor(n), expected_key(n);
+        for (size_t i = 0; i < n; ++i) {
+            const float r = expected_renders[i] >= 30.0f ? row_reach(expected_peak[i], logits[i]) : 1.0f;
+            const float largest = std::max({scales[3 * i], scales[3 * i + 1], scales[3 * i + 2]});
+            expected_factor[i] = r < 0.16f && largest >= -2.0f ? r : 1.0f;
+            const float p = expected_peak[i];
+            expected_key[i] = p < 0.01f ? p - 1.0f : row_reach(p, logits[i]);
+        }
+        auto logits_gpu = gpu(logits);
+        const auto scales_gpu = gpu_rows(scales, 3);
+        auto factor = Tensor::empty({n}, Device::GPU), key = Tensor::empty({n}, Device::GPU);
+        growth.covered_factor(peak_gpu, renders_gpu, logits_gpu, scales_gpu, 30.0f, 0.16f, -2.0f, factor);
+        growth.retire_key(peak_gpu, logits_gpu, 0.01f, key);
+        expect_close(host_f(factor), expected_factor, "growth.covered_factor");
+        expect_close(host_f(key), expected_key, "growth.retire_key");
+
+        // lowest_rows: eligible rows by ascending value (-0 = +0), then eligible NaNs, then ineligible rows, ties
+        // by row; the full order and its first rows.
+        std::vector<float> tied(n);
+        for (size_t i = 0; i < n; ++i)
+            tied[i] = static_cast<float>(static_cast<int>((i * 7919u) % 19u) - 9);
+        tied[11] = -0.0f;
+        tied[12] = 0.0f;
+        tied[13] = std::numeric_limits<float>::infinity();
+        tied[14] = std::numeric_limits<float>::quiet_NaN();
+        tied[15] = -std::numeric_limits<float>::infinity();
+        tied[16] = std::numeric_limits<float>::quiet_NaN();
+        const auto eligible = every(n, 3);
+        std::vector<bool> chosen(n);
+        for (size_t i = 0; i < n; ++i)
+            chosen[i] = !eligible[i];
+        const auto key_of = [&](const size_t i) {
+            if (!chosen[i])
+                return 0xffffffffu;
+            const uint32_t bits = std::bit_cast<uint32_t>(tied[i]);
+            if ((bits & 0x7fffffffu) > 0x7f800000u)
+                return 0xfffffffeu;
+            if (bits == 0x80000000u)
+                return 0x80000000u;
+            return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        };
+        std::vector<int64_t> order(n);
+        std::iota(order.begin(), order.end(), int64_t{0});
+        std::stable_sort(order.begin(), order.end(),
+                         [&](const int64_t a, const int64_t b) { return key_of(size_t(a)) < key_of(size_t(b)); });
+        for (const size_t count : {n, size_t{100}}) {
+            auto rows = Tensor::empty({count}, Device::GPU, DataType::Int64);
+            growth.lowest_rows(gpu(tied), gpu_bool(chosen), rows);
+            EXPECT_EQ(host_i64(rows), std::vector<int64_t>(order.begin(), order.begin() + static_cast<ptrdiff_t>(count)))
+                << count << " rows";
+        }
+    }
+
     TEST_P(PortableDensifyOps, MrnfWeightsAndCompaction) {
         constexpr size_t m = 64;
         const auto opacity = values(m, 1.f, 3, 0.5f);

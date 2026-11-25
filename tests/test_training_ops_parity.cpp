@@ -2930,6 +2930,11 @@ namespace {
             GTEST_SKIP();
         compare_training_changes(capture_growth_and_retire(GpuBackend::Vulkan), capture_growth_and_retire(GpuBackend::CUDA));
     }
+    TEST(TrainingOpsParity, GrowthRetirementAndConservingSplitMetalMatchesVulkan) {
+        if (!lfs::core::gpu_backend_available(GpuBackend::Metal) || !lfs::core::gpu_backend_available(GpuBackend::Vulkan))
+            GTEST_SKIP();
+        compare_training_changes(capture_growth_and_retire(GpuBackend::Metal), capture_growth_and_retire(GpuBackend::Vulkan));
+    }
     TEST(TrainingOpsParity, CalibrationAndBlurredLoss) {
         if (!lfs::core::gpu_backend_available(GpuBackend::CUDA) || !lfs::core::gpu_backend_available(GpuBackend::Vulkan))
             GTEST_SKIP();

@@ -121,4 +121,6 @@ namespace lfs::training {
     float portable_mrnf_kth_largest(gpu_ops::In values, gpu_ops::In include, size_t k);
     void portable_mrnf_rank_exchange_rows(gpu_ops::In primary, gpu_ops::In secondary, gpu_ops::In eligible,
                                           gpu_ops::Out rows);
+    // MrnfGrowthOps from one Slang program (mrnf_growth.slang), for backends that run GpuKernelModule programs.
+    const gpu_ops::MrnfGrowthOps& portable_mrnf_growth_ops();
 } // namespace lfs::training
