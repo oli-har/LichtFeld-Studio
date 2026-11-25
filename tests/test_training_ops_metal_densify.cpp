@@ -616,6 +616,81 @@ namespace {
         EXPECT_EQ(host_u8(free_gpu), expected_free);
     }
 
+    // MRNF splits at the cap so that the halves composite back to the parent: each child takes 1 - sqrt(1 - o),
+    // computed in logits so that it stays exact at both ends, and the longest and the smallest axis shrink by the
+    // factor while the middle one stays.
+    TEST_P(PortableDensifyOps, RefineConservingSplitCompositesToTheParentOpacity) {
+        constexpr float kFactor = 0.7f;
+        const std::vector<float> opacity{-20.f, -6.f, -1.f, 0.f, 0.5f, 2.f, 6.f, 15.f, 20.f};
+        const size_t n = opacity.size();
+        auto means = unit_values(3 * n);
+        auto rotations = unit_values(4 * n, 0.1f);
+        auto scales = unit_values(3 * n, -2.f);
+        // A tie between the two shorter axes: the smallest is the lower axis.
+        scales[4 * 3] = -1.0f;
+        scales[4 * 3 + 1] = scales[4 * 3 + 2] = -1.8f;
+        const auto sh0 = unit_values(3 * n);
+        std::vector<int64_t> ids(n);
+        std::iota(ids.begin(), ids.end(), int64_t{0});
+        auto means_gpu = gpu_rows(means, 3), rotations_gpu = gpu_rows(rotations, 4), scales_gpu = gpu_rows(scales, 3);
+        auto sh0_gpu = Tensor::from_vector(sh0, {n, 1, 3}, Device::GPU);
+        auto opacity_gpu = Tensor::from_vector(opacity, {n, 1}, Device::GPU);
+        auto child_means = Tensor::zeros({n, 3}, Device::GPU), child_rotations = Tensor::zeros({n, 4}, Device::GPU);
+        auto child_scales = Tensor::zeros({n, 3}, Device::GPU), child_sh0 = Tensor::zeros({n, 1, 3}, Device::GPU);
+        auto child_opacity = Tensor::zeros({n, 1}, Device::GPU);
+        ASSERT_NE(refine().conserving_split, nullptr);
+        refine().conserving_split({means_gpu, rotations_gpu, scales_gpu, sh0_gpu, opacity_gpu},
+                                  {child_means, child_rotations, child_scales, child_sh0, child_opacity}, gpu_i64(ids),
+                                  kFactor);
+
+        // The conserving branch of long_axis_split_gaussians_inplace_kernel (densification_kernels.cu).
+        std::vector<float> expected_means = means, expected_scales = scales, expected_opacity(n);
+        std::vector<float> expected_child_means, expected_child_scales;
+        for (size_t s = 0; s < n; ++s) {
+            const float* q = &rotations[s * 4];
+            const float inverse_norm = std::min(1.0f / std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]), 1e12f);
+            const float w = q[0] * inverse_norm, x = q[1] * inverse_norm, y = q[2] * inverse_norm, z = q[3] * inverse_norm;
+            const float r[9] = {1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - w * z), 2.0f * (x * z + w * y),
+                                2.0f * (x * y + w * z), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - w * x),
+                                2.0f * (x * z - w * y), 2.0f * (y * z + w * x), 1.0f - 2.0f * (x * x + y * y)};
+            const float* sc = &scales[s * 3];
+            const float largest = std::max(sc[0], std::max(sc[1], sc[2]));
+            const unsigned axes[3][3] = {{0, 1, 2}, {1, 0, 2}, {2, 0, 1}};
+            const unsigned* order = largest == sc[0] ? axes[0] : (largest == sc[1] ? axes[1] : axes[2]);
+            const unsigned smallest = sc[order[1]] <= sc[order[2]] ? order[1] : order[2];
+            const unsigned middle = smallest == order[1] ? order[2] : order[1];
+            const float magnitude = std::exp(sc[order[0]]) * 0.5f;
+            float new_scale[3];
+            new_scale[order[0]] = sc[order[0]] + std::log(kFactor);
+            new_scale[middle] = sc[middle];
+            new_scale[smallest] = sc[smallest] + std::log(kFactor);
+            const float o = opacity[s];
+            const float softplus_x = std::max(o, 0.0f) + std::log1p(std::exp(-std::abs(o)));
+            const float softplus_neg_x = std::max(-o, 0.0f) + std::log1p(std::exp(-std::abs(o)));
+            const float log_s = -0.5f * softplus_x;
+            expected_opacity[s] = -softplus_neg_x - std::log1p(std::exp(log_s)) - log_s;
+            for (int d = 0; d < 3; ++d) {
+                const float offset = r[order[0] + 3 * d] * magnitude;
+                expected_child_means.push_back(means[s * 3 + d] - offset);
+                expected_means[s * 3 + d] = means[s * 3 + d] + offset;
+                expected_child_scales.push_back(new_scale[d]);
+                expected_scales[s * 3 + d] = new_scale[d];
+            }
+            // The two halves composite to the parent: 1 - (1 - child)^2 = parent.
+            const double child = 1.0 / (1.0 + std::exp(-double(expected_opacity[s])));
+            const double parent = 1.0 / (1.0 + std::exp(-double(o)));
+            EXPECT_NEAR(1.0 - (1.0 - child) * (1.0 - child), parent, 1e-6 + 1e-5 * parent) << s;
+        }
+        expect_close(host_f(means_gpu), expected_means, "refine.conserving.means");
+        expect_close(host_f(scales_gpu), expected_scales, "refine.conserving.scales");
+        expect_close(host_f(opacity_gpu), expected_opacity, "refine.conserving.opacity");
+        expect_close(host_f(child_means), expected_child_means, "refine.conserving.child_means");
+        expect_close(host_f(child_scales), expected_child_scales, "refine.conserving.child_scales");
+        expect_close(host_f(child_opacity), expected_opacity, "refine.conserving.child_opacity");
+        expect_same(host_f(child_rotations), rotations, "refine.conserving.child_rotations");
+        expect_same(host_f(child_sh0), sh0, "refine.conserving.child_sh0");
+    }
+
     TEST_P(PortableDensifyOps, RefineCountsAndMedian) {
         constexpr size_t n = 5003;
         std::vector<bool> b0(n), b1(n / 2);

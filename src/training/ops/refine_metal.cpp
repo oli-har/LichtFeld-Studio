@@ -26,9 +26,11 @@ namespace lfs::training {
             uint64_t child_means, child_rotations, child_scales, child_sh0, child_opacity;
             uint64_t indices;
             uint32_t count;
+            float conserve_axis_scale;
         };
 
-        void split(const RefineOutputs& parents, const RefineOutputs& children, const Tensor& indices) {
+        void conserving_split(const RefineOutputs& parents, const RefineOutputs& children, const Tensor& indices,
+                              const float conserve_axis_scale) {
             const size_t n = indices.numel();
             if (n == 0)
                 return;
@@ -39,12 +41,16 @@ namespace lfs::training {
                                      mk::address(parents.opacity), mk::address(children.means),
                                      mk::address(children.rotations), mk::address(children.scales),
                                      mk::address(children.sh0), mk::address(children.opacity),
-                                     mk::address(indices), static_cast<uint32_t>(n)};
+                                     mk::address(indices), static_cast<uint32_t>(n), conserve_axis_scale};
             mk::launch_items("refine_split", params,
                              {&parents.means, &parents.rotations, &parents.scales, &parents.sh0, &parents.opacity,
                               &children.means, &children.rotations, &children.scales, &children.sh0,
                               &children.opacity, &indices},
                              n);
+        }
+
+        void split(const RefineOutputs& parents, const RefineOutputs& children, const Tensor& indices) {
+            conserving_split(parents, children, indices, 0.0f);
         }
 
         struct FillParams {
@@ -174,6 +180,7 @@ namespace lfs::training {
             .oversize_scores = oversize_scores,
             .dead_mask = dead_mask,
             .rotation_mask = rotation_mask,
+            .conserving_split = conserving_split,
         };
         return ops;
     }
