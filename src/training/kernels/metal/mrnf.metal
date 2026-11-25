@@ -54,13 +54,6 @@ static bool mrnf_flag(device const uchar* mask, const uint count, const uint i) 
 
 static float mrnf_sigmoid(const float x) { return 1.0f / (1.0f + exp(-x)); }
 
-static float mrnf_logit(float p) {
-    if (mrnf_is_nan(p))
-        return p;
-    p = fmin(fmax(p, 1e-12f), as_type<float>(0x3f7fffffu));
-    return log(p / (1.0f - p));
-}
-
 // Radix select: the element sorted[rank] of cub::DeviceRadixSort's float
 // order, in three passes of 11/11/10 bits. Selection s keeps its state
 // (total, rank, prefix, value bits) at workspace[4 s] and its histogram at
@@ -222,6 +215,18 @@ kernel void mrnf_noise(constant MrnfNoiseParams& p [[buffer(0)]], uint i [[threa
         p.means[i * 3 + d] += fmin(fmax(noise[d] * weight, -p.median_scale), p.median_scale);
 }
 
+// The decayed opacity in logits, CUDA's d_logit(d_sigmoid(x) - delta), in safe math with precise exp and log:
+// near opacity 1 the logit turns one ulp of the sigmoid into about 1e-5.
+#pragma METAL fp math_mode(safe)
+static float mrnf_decayed_logit(const float raw, const float delta) {
+    float p = 1.0f / (1.0f + precise::exp(-raw)) - delta;
+    if (mrnf_is_nan(p))
+        return p;
+    p = fmin(fmax(p, 1e-12f), as_type<float>(0x3f7fffffu));
+    return precise::log(p / (1.0f - p));
+}
+#pragma METAL fp math_mode(fast)
+
 struct MrnfDecayParams {
     device float* raw_opacity;
     device float* log_scales;
@@ -251,7 +256,7 @@ kernel void mrnf_decay(constant MrnfDecayParams& p [[buffer(0)]], uint i [[threa
     const float raw = p.raw_opacity[i];
     if ((p.rendered_count == nullptr || p.rendered_count[i] > 0.0f) &&
         (opacity_delta != 0.0f || mrnf_is_inf(raw)))
-        p.raw_opacity[i] = mrnf_logit(mrnf_sigmoid(raw) - opacity_delta);
+        p.raw_opacity[i] = mrnf_decayed_logit(raw, opacity_delta);
     if (!(reach > 0.0f))
         return; // no reach: the scale stays as it is
     const float factor = 1.0f - scale_decay * t_shrink;
