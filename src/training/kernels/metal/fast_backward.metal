@@ -290,23 +290,19 @@ kernel void fast_blend_backward(constant FastBlendBackwardParams& p [[buffer(0)]
                 const float4 cd = p.color_depth[prim];
                 s_mean[rank] = p.mean_box[prim].mean;
                 s_conic[rank] = p.conic_opacity[prim];
-                // Clamped color; w holds which channels stayed below the upper clamp.
+                // Clamped color; w holds which channels stayed below the upper clamp (bits 0-2) and the entry's
+                // sub-tile coverage (bits 8-15), so the walk keeps no ballot mask per sub-tile.
                 const uint factor_bits = (cd.x <= kFastMaxBlendColor ? 1u : 0u) |
                                          (cd.y <= kFastMaxBlendColor ? 2u : 0u) |
                                          (cd.z <= kFastMaxBlendColor ? 4u : 0u);
-                s_color[rank] = float4(fmin(fmax(cd.xyz, 0.0f), kFastMaxBlendColor), as_type<float>(factor_bits));
+                s_color[rank] = float4(fmin(fmax(cd.xyz, 0.0f), kFastMaxBlendColor),
+                                       as_type<float>(factor_bits | (coverage << 8)));
                 s_depth[rank] = cd.w;
                 if (kFastNormalChannel != 0u)
                     s_normal[rank] = p.normals[prim].xyz;
             }
         }
-        uint mask[kFastBwdSubtiles];
         uint live = uint(static_cast<simd_vote::vote_t>(simd_ballot(staged)));
-#pragma unroll
-        for (uint k = 0u; k < kFastBwdSubtiles; ++k) {
-            const bool hit = (coverage & (1u << (warp + kFastBwdWarps * k))) != 0u;
-            mask[k] = uint(static_cast<simd_vote::vote_t>(simd_ballot(hit)));
-        }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         while (live != 0u) {
             const uint bit = ctz(live);
@@ -327,7 +323,7 @@ kernel void fast_blend_backward(constant FastBlendBackwardParams& p [[buffer(0)]
             bool contributed = false;
 #pragma unroll
             for (uint k = 0u; k < kFastBwdSubtiles; ++k) {
-                if ((mask[k] >> bit) & 1u)
+                if ((bits >> (8u + warp + kFastBwdWarps * k)) & 1u)
                     contributed |= fast_accumulate_pixel(px[k], a, tile_primitive, mean, co, c.xyz, factor, depth, normal);
             }
             // The rows share dx. Form mean/conic gradients once from H, Hy, Hyy.
