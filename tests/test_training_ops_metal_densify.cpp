@@ -278,6 +278,68 @@ namespace {
         }
     }
 
+    // MRNF's keep-covered: both decays scale by the row's reach, clamped to [0, 1]; at reach 0 the scales stay as
+    // they are. Rows without renders keep their opacity (opacity_decay_rendered_only).
+    TEST_P(PortableDensifyOps, MrnfDecayScalesByReach) {
+        constexpr size_t n = 263;
+        auto raw = values(n, 1.5f, 9);
+        raw[3] = std::numeric_limits<float>::infinity();
+        const auto log_scales = values(3 * n, 0.4f, 11);
+        const auto frozen = every(n, 5);
+        constexpr std::array<float, 6> kReach{-0.5f, 0.0f, 0.3f, 1.0f, 1.7f, 0.75f};
+        std::vector<float> reach(n), rendered(n);
+        for (size_t i = 0; i < n; ++i) {
+            reach[i] = kReach[i % kReach.size()];
+            rendered[i] = i % 4 == 0 ? 0.0f : 2.0f;
+        }
+        const ops::DecayParams params{.opacity_decay = 0.02f,
+                                      .scale_decay = 0.01f,
+                                      .train_t = 0.4f,
+                                      .rendered_count = gpu(rendered),
+                                      .reach = gpu(reach)};
+        auto raw_gpu = gpu(raw);
+        auto scales_gpu = gpu_rows(log_scales, 3);
+        mrnf().decay(raw_gpu, scales_gpu, gpu_bool(frozen), params);
+
+        // mrnf_decay_kernel of mrnf_kernels.cu.
+        auto expected_raw = raw;
+        auto expected_scales = log_scales;
+        std::vector<bool> scales_kept(n), opacity_kept(n);
+        for (size_t i = 0; i < n; ++i) {
+            scales_kept[i] = opacity_kept[i] = frozen[i];
+            if (frozen[i])
+                continue;
+            const float r = std::clamp(reach[i], 0.0f, 1.0f);
+            const float t = (1.0f - params.train_t) * r;
+            const float delta = params.opacity_decay * t;
+            if (rendered[i] > 0.0f && (delta != 0.0f || std::isinf(raw[i]))) {
+                const float p = std::clamp(sigmoid(raw[i]) - delta, 1e-12f, std::nextafter(1.0f, 0.0f));
+                expected_raw[i] = std::log(p / (1.0f - p));
+            } else {
+                opacity_kept[i] = true;
+            }
+            if (!(r > 0.0f)) {
+                scales_kept[i] = true;
+                continue;
+            }
+            for (int d = 0; d < 3; ++d)
+                expected_scales[i * 3 + d] =
+                    std::log(std::max(std::exp(log_scales[i * 3 + d]) * (1.0f - params.scale_decay * t), 1e-12f));
+        }
+        const auto actual_raw = host_f(raw_gpu);
+        const auto actual_scales = host_f(scales_gpu);
+        expect_close(actual_raw, expected_raw, "mrnf.decay_reach.opacity");
+        expect_close(actual_scales, expected_scales, "mrnf.decay_reach.scales");
+        for (size_t i = 0; i < n; ++i) {
+            if (opacity_kept[i])
+                EXPECT_EQ(std::bit_cast<uint32_t>(actual_raw[i]), std::bit_cast<uint32_t>(raw[i])) << i;
+            if (scales_kept[i])
+                for (size_t d = 0; d < 3; ++d)
+                    EXPECT_EQ(std::bit_cast<uint32_t>(actual_scales[3 * i + d]), std::bit_cast<uint32_t>(log_scales[3 * i + d]))
+                        << i;
+        }
+    }
+
     TEST_P(PortableDensifyOps, MrnfPercentileBoundsSelectCubOrder) {
         constexpr size_t n = 1029;
         auto means = values(3 * n, 3.f, 2);
