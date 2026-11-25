@@ -89,15 +89,14 @@ struct FastBackwardPixel {
     float edge_weight;
     // Composite of everything behind the walk so far, starting at the background.
     float3 behind;
+    // Contributors of the pixel in the forward; 0 outside the image, so the walk skips those pixels on it alone.
     uint last;
-    bool inside;
 };
 
 static FastBackwardPixel fast_backward_pixel(constant FastBlendBackwardParams& p, const uint2 pix, const bool inside,
                                              const uint final_index) {
     FastBackwardPixel s;
     s.pixel = float2(pix) + 0.5f;
-    s.inside = inside;
     s.grad_color = float3(0.0f);
     s.grad_normal = float3(0.0f);
     s.transmittance = 1.0f;
@@ -153,7 +152,7 @@ struct FastBlendAccum {
 static bool fast_accumulate_pixel(thread FastBackwardPixel& s, thread FastBlendAccum& a, const uint tile_primitive,
                                   const float2 mean, const float4 conic_opacity, const float3 color,
                                   const float3 color_factor, const float depth, const float3 normal) {
-    if (!s.inside || tile_primitive >= s.last)
+    if (tile_primitive >= s.last)
         return false;
     const float2 d = mean - s.pixel;
     const float sigma_over_2 =
