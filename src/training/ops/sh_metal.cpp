@@ -36,7 +36,7 @@ namespace lfs::training {
             if (width == 0 || rows == 0)
                 return;
             const CopyParams params{source, destination, width, rows, source_pitch, destination_pitch};
-            launch_items("sh_copy_rows", params, uses, width * rows);
+            launch_items_wide("sh_copy_rows", params, uses, width * rows);
         }
 
     } // namespace metal
@@ -317,7 +317,7 @@ namespace lfs::training {
             if (byte_count == 0)
                 return;
             const FillParams params{mk::address(storage), byte_count, value};
-            mk::launch_items("sh_fill_bytes", params, {&storage}, byte_count);
+            mk::launch_items_wide("sh_fill_bytes", params, {&storage}, byte_count);
         }
 
         // Metal tensors cannot view raw device memory, so the result is an owned

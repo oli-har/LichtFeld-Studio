@@ -321,8 +321,11 @@ struct ShFillParams {
     uint value;
 };
 
-kernel void sh_fill_bytes(constant ShFillParams& p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
-    if (ulong(i) < p.count)
+// 64-bit index from the threadgroup: SH stores pass 4 GiB, past a 32-bit thread index (launch_items_wide).
+kernel void sh_fill_bytes(constant ShFillParams& p [[buffer(0)]], uint group [[threadgroup_position_in_grid]],
+                          uint lane [[thread_position_in_threadgroup]], uint width [[threads_per_threadgroup]]) {
+    const ulong i = ulong(group) * width + lane;
+    if (i < p.count)
         p.destination[i] = uchar(p.value);
 }
 
@@ -336,11 +339,14 @@ struct ShCopyParams {
     ulong destination_pitch;
 };
 
-kernel void sh_copy_rows(constant ShCopyParams& p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
-    if (ulong(i) >= p.width * p.rows)
+// 64-bit index from the threadgroup, as sh_fill_bytes.
+kernel void sh_copy_rows(constant ShCopyParams& p [[buffer(0)]], uint group [[threadgroup_position_in_grid]],
+                         uint lane [[thread_position_in_threadgroup]], uint width [[threads_per_threadgroup]]) {
+    const ulong i = ulong(group) * width + lane;
+    if (i >= p.width * p.rows)
         return;
-    const ulong row = ulong(i) / p.width;
-    const ulong column = ulong(i) % p.width;
+    const ulong row = i / p.width;
+    const ulong column = i % p.width;
     p.destination[row * p.destination_pitch + column] = p.source[row * p.source_pitch + column];
 }
 

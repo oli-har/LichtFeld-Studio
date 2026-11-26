@@ -45,11 +45,21 @@ namespace lfs::training::metal {
     // Device address of a tensor, or 0 when it is absent.
     inline uint64_t address(const core::Tensor& tensor) { return kernels().address(tensor); }
 
+    // The kernels index threads with a 32-bit thread_position_in_grid, which covers 2^32 threads per dimension.
+    // A launch past that would leave work undone silently, so it stops here; kernels that form a 64-bit index from
+    // their threadgroup launch through launch_items_wide.
+    inline void check_grid(const std::string_view function, const uint64_t groups, const uint32_t width) {
+        if (groups * width > (uint64_t{1} << 32))
+            throw std::overflow_error(std::format("Metal kernel '{}' needs {} threads, past its 32-bit thread index",
+                                                  function, groups * width));
+    }
+
     template <class Params>
     void launch(const std::string_view function, const Params& params,
                 const std::initializer_list<const core::Tensor*> uses, const uint32_t groups,
                 const uint32_t width = kGroupWidth,
                 const std::initializer_list<std::pair<uint32_t, uint32_t>> constants = {}) {
+        check_grid(function, groups, width);
         kernels().launch({.function = function,
                           .params = std::as_bytes(std::span(&params, 1)),
                           .uses = std::span(uses.begin(), uses.size()),
@@ -64,6 +74,8 @@ namespace lfs::training::metal {
                    const std::initializer_list<const core::Tensor*> uses, const uint32_t groups_x,
                    const uint32_t groups_y, const uint32_t width, const uint32_t height,
                    const std::initializer_list<std::pair<uint32_t, uint32_t>> constants = {}) {
+        check_grid(function, groups_x, width);
+        check_grid(function, groups_y, height);
         kernels().launch({.function = function,
                           .params = std::as_bytes(std::span(&params, 1)),
                           .uses = std::span(uses.begin(), uses.size()),
@@ -78,6 +90,19 @@ namespace lfs::training::metal {
                       const std::initializer_list<const core::Tensor*> uses, const size_t items,
                       const std::initializer_list<std::pair<uint32_t, uint32_t>> constants = {}) {
         launch(function, params, uses, core::GpuKernelModule::groups_for(items, kGroupWidth), kGroupWidth, constants);
+    }
+
+    // One thread per item, for kernels that form a 64-bit item index from threadgroup_position_in_grid, so the
+    // item count may pass 2^32.
+    template <class Params>
+    void launch_items_wide(const std::string_view function, const Params& params,
+                           const std::initializer_list<const core::Tensor*> uses, const size_t items) {
+        kernels().launch({.function = function,
+                          .params = std::as_bytes(std::span(&params, 1)),
+                          .uses = std::span(uses.begin(), uses.size()),
+                          .groups = {core::GpuKernelModule::groups_for(items, kGroupWidth), 1, 1},
+                          .group = {kGroupWidth, 1, 1},
+                          .constants = {}});
     }
 
 } // namespace lfs::training::metal

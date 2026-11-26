@@ -15,6 +15,9 @@
 #include "core/tensor_backend.hpp"
 #include "lfs/training/ops/popspa.hpp"
 #include "lfs/training/ops/registry.hpp"
+#ifdef LFS_TENSOR_METAL
+#include "ops/metal_kernels.hpp"
+#endif
 
 #include "cuda_backend_test.hpp"
 #include <gtest/gtest.h>
@@ -1786,5 +1789,21 @@ namespace {
 
     INSTANTIATE_TEST_SUITE_P(Backends, PortableFastRaster, testing::Values(GpuBackend::Metal, GpuBackend::Vulkan),
                              [](const auto& info) { return std::string(lfs::core::gpu_backend_name(info.param)); });
+
+#ifdef LFS_TENSOR_METAL
+    // The trainer's Metal kernels index threads in 32 bits, so a launch past 2^32 threads would leave work undone
+    // silently; the launcher refuses it before anything is dispatched. Only the kernels that form a 64-bit index from
+    // their threadgroup go past it, through launch_items_wide.
+    TEST(MetalTrainingLaunch, RefusesGridsPastThe32BitThreadIndex) {
+        const struct {
+            uint64_t values = 0, indices = 0;
+            uint32_t count = 0, slots = 0;
+        } params;
+        namespace mk = lfs::training::metal;
+        EXPECT_THROW(mk::launch_items("sh_zero_rows", params, {}, (size_t{1} << 32) + 1), std::overflow_error);
+        EXPECT_THROW(mk::launch("sh_zero_rows", params, {}, (1u << 24) + 1u, 256u), std::overflow_error);
+        EXPECT_THROW(mk::launch_2d("sh_zero_rows", params, {}, (1u << 28) + 1u, 1u, 16u, 16u), std::overflow_error);
+    }
+#endif
 
 } // namespace
