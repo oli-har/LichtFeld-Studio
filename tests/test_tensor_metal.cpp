@@ -32,8 +32,8 @@
 #include "core/tensor_splat.hpp"
 #include "core/tensor_upload.hpp"
 
-#include <gtest/gtest.h>
 #include <glm/gtc/matrix_transform.hpp>
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
