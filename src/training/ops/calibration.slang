@@ -332,44 +332,62 @@ void accumulate(uint3 groupId : SV_GroupID, uint laneId : SV_GroupIndex) {
 }
 groupshared float2 old[81];
 groupshared float trace[81];
+groupshared float pointSums[81 * 5];
+groupshared uint pointDiffers[81];
+// One group. Each of a control point's five sums over its cells' chunks runs in a thread of its own (405 of the
+// group's 512), adding the same terms in the same order as one thread per point did; the point's thread then solves.
+static const int update_threads = 512;
 [shader("compute")]
-[numthreads(128, 1, 1)]
+[numthreads(512, 1, 1)]
 void update(uint laneId : SV_GroupIndex) {
     const Tile t = tile();
-    const int i = int(laneId);
-    const int side = t.side, cells = side - 1, points = side * side, x = i % side, y = i / side, chunks = p.chunks;
+    const int lane = int(laneId);
+    const int side = t.side, cells = side - 1, points = side * side, chunks = p.chunks;
     const int row = fieldBase();
     let partials = p.partials;
-    float q[5] = {0, 0, 0, 0, 0};
-    bool differs = false;
-    for (int k = 0; i < points && k < 4; ++k) {
-        int cx = x - (k & 1);
-        const int cy = y - (k >> 1);
-        // A panorama's first and last control column are one longitude: both gather the cells on either side.
-        if (t.wrap && cx < 0)
-            cx = cells - 1;
-        if (t.wrap && cx == cells)
-            cx = 0;
-        if (cx < 0 || cx >= cells || cy < 0 || cy >= cells)
-            continue;
-        for (int j = 0; j < chunks; ++j) {
-            int base = ((cy * cells + cx) * chunks + j) * partial_size;
-            differs = differs || partials[base + 20] != 0;
-            for (int f = 0; f < 5; ++f)
-                q[f] += partials[base + k * 5 + f];
+    {
+        const int point = lane / 5, f = lane % 5, x = point % side, y = point / side;
+        float sum = 0;
+        bool differs = false;
+        for (int k = 0; point < points && k < 4; ++k) {
+            int cx = x - (k & 1);
+            const int cy = y - (k >> 1);
+            // A panorama's first and last control column are one longitude: both gather the cells on either side.
+            if (t.wrap && cx < 0)
+                cx = cells - 1;
+            if (t.wrap && cx == cells)
+                cx = 0;
+            if (cx < 0 || cx >= cells || cy < 0 || cy >= cells)
+                continue;
+            for (int j = 0; j < chunks; ++j) {
+                int base = ((cy * cells + cx) * chunks + j) * partial_size;
+                if (f == 0)
+                    differs = differs || partials[base + 20] != 0;
+                sum += partials[base + k * 5 + f];
+            }
+        }
+        if (point < points) {
+            pointSums[point * 5 + f] = sum;
+            if (f == 0)
+                pointDiffers[point] = uint(differs);
         }
     }
+    GroupMemoryBarrierWithGroupSync();
+    const int i = lane, x = i % side, y = i / side;
+    float q[5] = {0, 0, 0, 0, 0};
+    if (i < points)
+        for (int f = 0; f < 5; ++f)
+            q[f] = pointSums[i * 5 + f];
     if (i < points)
         old[i] = p.field[row + i];
     if (i < points)
         trace[i] = q[2] + q[4];
-    nonzero[i] = uint(differs);
     GroupMemoryBarrierWithGroupSync();
     if (i >= points)
         return;
     uint anyDiff = 0;
     for (int j = 0; j < points; j++)
-        anyDiff |= nonzero[j];
+        anyDiff |= pointDiffers[j];
     if (!anyDiff) {
         // Equal images can leave roundoff in a windowed loss derivative.
         q[0] = q[1] = 0;

@@ -55,7 +55,8 @@ namespace lfs::training {
         };
         bool bytes(const Tensor& t) { return t.dtype() != core::DataType::Float32; }
 
-        void run(const char* function, In field, Parameters p, const Tensors& tensors, uint32_t groups) {
+        void run(const char* function, In field, Parameters p, const Tensors& tensors, uint32_t groups,
+                 uint32_t group = 128) {
             const auto backend = core::gpu_backend_of(field).value_or(core::default_gpu_backend());
             const core::GpuBackendScope scope(backend);
             auto program = GpuKernelModule::load(calibration_program_entries(), backend);
@@ -68,7 +69,7 @@ namespace lfs::training {
             auto result = (*program)->dispatch({.function = function,
                                                 .arguments = {std::as_bytes(std::span(&p, 1)), bindings},
                                                 .groups = {groups, 1, 1},
-                                                .group = {128, 1, 1}});
+                                                .group = {group, 1, 1}});
             if (!result)
                 throw lfs::Exception(std::move(result).error());
         }
@@ -143,7 +144,7 @@ namespace lfs::training {
             auto p = parameters(t, slot);
             p.chunks = chunks;
             p.step = step;
-            run("update", field, p, s, 1);
+            run("update", field, p, s, 1, 512); // one group of update_threads (calibration.slang)
         }
 
         void clear_outside(const Tile& t, In field, int slot, Out grad) {
