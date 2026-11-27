@@ -321,15 +321,14 @@ struct ShFillParams {
     uint value;
 };
 
-// 64-bit index from the threadgroup: SH stores pass 4 GiB, past a 32-bit thread index (launch_items_wide).
-kernel void sh_fill_bytes(constant ShFillParams& p [[buffer(0)]], uint group [[threadgroup_position_in_grid]],
-                          uint lane [[thread_position_in_threadgroup]], uint width [[threads_per_threadgroup]]) {
-    const ulong i = ulong(group) * width + lane;
-    if (i < p.count)
+// One piece of a fill: the host splits a fill past 2^31 bytes into pieces, each from its own 64-bit address.
+kernel void sh_fill_bytes(constant ShFillParams& p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    if (ulong(i) < p.count)
         p.destination[i] = uchar(p.value);
 }
 
-// Copies `rows` rows of `width` bytes between pitched buffers.
+// Copies `rows` rows of `width` bytes between pitched buffers: bytes [first, first + count) of the row-major
+// sequence, one piece of a copy that the host splits past 2^31 bytes.
 struct ShCopyParams {
     device const uchar* source;
     device uchar* destination;
@@ -337,16 +336,16 @@ struct ShCopyParams {
     ulong rows;
     ulong source_pitch;
     ulong destination_pitch;
+    ulong first;
+    ulong count;
 };
 
-// 64-bit index from the threadgroup, as sh_fill_bytes.
-kernel void sh_copy_rows(constant ShCopyParams& p [[buffer(0)]], uint group [[threadgroup_position_in_grid]],
-                         uint lane [[thread_position_in_threadgroup]], uint width [[threads_per_threadgroup]]) {
-    const ulong i = ulong(group) * width + lane;
-    if (i >= p.width * p.rows)
+kernel void sh_copy_rows(constant ShCopyParams& p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    if (ulong(i) >= p.count)
         return;
-    const ulong row = i / p.width;
-    const ulong column = i % p.width;
+    const ulong byte = p.first + i;
+    const ulong row = byte / p.width;
+    const ulong column = byte % p.width;
     p.destination[row * p.destination_pitch + column] = p.source[row * p.source_pitch + column];
 }
 
