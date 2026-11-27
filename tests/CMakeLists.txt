@@ -1246,6 +1246,7 @@ if(NOT LFS_HAS_CUDA)
             test_large_model_counts.cpp
             test_large_model_sh_slots.cpp
             test_large_model_refine.cpp
+            test_large_model_sh_bytes.cpp
             test_training_ops_metal_fast.cpp
             test_roi_masks.cpp
             test_roi_polygon_weight_map.cpp
@@ -1653,6 +1654,7 @@ set(TEST_FILES
     test_large_model_counts.cpp
     test_large_model_sh_slots.cpp
     test_large_model_refine.cpp
+    test_large_model_sh_bytes.cpp
     test_python_io.cpp
     test_extended_unary_ops_vs_torch.cpp
     test_scene_validity.cpp
