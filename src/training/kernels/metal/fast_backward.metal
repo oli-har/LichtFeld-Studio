@@ -512,6 +512,83 @@ static void fast_adam_step(constant FastAdamGroup& g, thread const float* grads,
         fast_adam_row<8>(g, grads, p, row_elements, step_scale, beta1, beta2, eps, scratch, t, owner);
 }
 
+// fast_adam_row in two halves around a block reduction that other groups share:
+// the update half returns the row's (u_min, -u_max, s_min, -s_max).
+struct FastRowCodes {
+    float us_u[4];
+    float us_s[4];
+    uint row, base;
+};
+
+template <int BITS>
+static float4 fast_adam_row_update(constant FastAdamGroup& g, thread const float* grads, const uint p,
+                                   const uint row_elements, const float step_scale, const float beta1,
+                                   const float beta2, const float eps, const uint block, const bool owner,
+                                   thread FastRowCodes& c) {
+    const FastRowStep r = fast_row_step(g, p, step_scale);
+    const uint n_attr = uint(max(g.attributes, 1));
+    const uint base = p * n_attr;
+    const bool touch = owner && r.touch && g.attributes > 0 && base < uint(g.elements);
+    const uint row = touch ? min(n_attr, uint(g.elements) - base) : 0u;
+    const uint active = min(row_elements, row);
+    const float4 old_mm = touch ? g.bounds[block] : float4(0.0f);
+    device float* param = reinterpret_cast<device float*>(g.param);
+    c.row = row;
+    c.base = base;
+    float4 local = float4(1e30f);
+    for (uint i = 0; i < row; ++i) {
+        const float2 mv = JointCodec<BITS>::decode_g1g2(g.packed, long(base + i), old_mm);
+        float m = mv.x;
+        float v = mv.y;
+        if (r.apply) {
+            const float grad = i < active ? grads[i] : 0.0f;
+            float hinge = 0.0f;
+            if (i < active && g.screen_share != nullptr && p < uint(g.screen_share_n))
+                hinge = screen_share_hinge_extra_grad(g.screen_share[p], g.screen_share_limit,
+                                                      g.screen_share_penalty, mv.y, g.bc2_sqrt_rcp, eps);
+            m = beta1 * mv.x + (1.0f - beta1) * (grad + hinge);
+            v = beta2 * mv.y + (1.0f - beta2) * grad * grad;
+            if (i < active)
+                param[base + i] -= fast_adam_delta(r.step, m, v, g.bc2_sqrt_rcp, eps);
+        }
+        const float2 us = JointCodec<BITS>::g1g2_to_us(m, v);
+        c.us_u[i] = us.x;
+        c.us_s[i] = us.y;
+        local = fmin(local, float4(us.x, -us.x, us.y, -us.y));
+    }
+    return local;
+}
+
+// The encode half: lane 0 stores the new block bounds, every owner encodes its row.
+template <int BITS>
+static void fast_adam_row_encode(constant FastAdamGroup& g, thread const FastRowCodes& c, const float4 mm,
+                                 const FastLane t) {
+    if (g.enabled != 0u && g.bounds != nullptr && t.lane == 0u)
+        g.bounds[t.block] = mm;
+    const float2 inv = fast_inverse_ranges(mm);
+    for (uint i = 0; i < c.row; ++i)
+        JointCodec<BITS>::encode_us(g.packed, long(c.base + i), c.us_u[i], c.us_s[i], mm.x, mm.z, inv.x, inv.y);
+}
+
+// The halves of threadgroup_min4 and fast_block_bounds around a barrier that
+// several reductions share: each SIMD group's minimum, then, after the
+// barrier, the minimum over the groups in the same order.
+static float4 fast_simd_min4(const float4 v) {
+    return float4(simd_min(v.x), simd_min(v.y), simd_min(v.z), simd_min(v.w));
+}
+
+static float4 fast_group_min4(threadgroup const float4* partials, const uint simd_groups) {
+    float4 r = partials[0];
+    for (uint s = 1; s < simd_groups; ++s)
+        r = min(r, partials[s]);
+    return r;
+}
+
+// fast_block_bounds and threadgroup_q16_bounds from the block's minimum.
+static float4 fast_bounds_of(const float4 r) { return r.x > -r.y ? float4(0.0f) : float4(r.x, -r.y, r.z, -r.w); }
+
+static float2 fast_value_bounds_of(const float4 r) { return r.x > -r.y ? float2(0.0f) : float2(r.x, -r.y); }
+
 // One cell's moment update from its codes (u_q, s_q).
 static float2 fast_shN_moment(const float grad, const float2 codes, const float4 old_mm,
                               const bool apply, const bool update, const float beta1, const float beta2,
@@ -566,31 +643,48 @@ static float4 fast_shN_slot_grad(const uint k, const bool compute, thread const 
     return g;
 }
 
-// SH rest slots per thread in fast_backward_sh: a primitive's twelve float4
-// slots spread over kFastShParts threads, so each keeps its updated moments in
-// registers between the bound reduction and the encode.
+// SH rest slots per thread in fast_backward_sh: a primitive's float4 slots
+// spread over up to kFastShParts threads, so each keeps its updated moments in
+// registers between the bound reduction and the encode. The host dispatches one
+// thread per primitive when the layout's slots fit one thread (degree 2 and
+// below), kFastShParts otherwise.
 constant constexpr uint kFastShSlotsPerThread = 6u;
 constant constexpr uint kFastShParts = kShMaxSlots / kFastShSlotsPerThread;
 
+// Updated moments and values of a thread's slots, kept between the update
+// half of fast_adam_shN and its encode half.
+struct FastShNCodes {
+    float4 us_u[kFastShSlotsPerThread];
+    float4 us_s[kFastShSlotsPerThread];
+    float4 updated[kFastShSlotsPerThread];
+    bool touch;
+};
+
 // Port of apply_shN_grads_packed_joint (8-bit moments on float4-slot cells) for
-// the slots [part * kFastShSlotsPerThread, ...) of primitive p. Every thread of
-// the threadgroup must call it.
-static void fast_adam_shN(constant FastAdamGroup& g, const uint p, const uint part, const uint layout_rest,
-                          const float3 grad_color, const float3 direction, const bool compute, const bool3 regularizer_allowed,
-                          const float sh_weight, thread float& sh_loss, const uint primitives, const float beta1,
-                          const float beta2, const float eps, threadgroup float4* scratch, const FastLane t) {
+// the slots [part * kFastShSlotsPerThread, ...) of primitive p, the update
+// half: returns whether the group takes the block reductions, with this
+// thread's moment and value minimums in local and value_local.
+static bool fast_adam_shN_update(constant FastAdamGroup& g, const uint p, const uint part, const uint layout_rest,
+                                 const float3 grad_color, const float3 direction, const bool compute,
+                                 const bool3 regularizer_allowed, const float sh_weight, thread float& sh_loss,
+                                 const uint primitives, const float beta1, const float beta2, const float eps,
+                                 const uint block, thread FastShNCodes& codes, thread float4& local,
+                                 thread float2& value_local) {
     const bool q16 = kFastShStorage == kFastShQ16;
     const bool f16 = kFastShStorage == kFastShFloat16;
     const uint cells = q16 ? uint(g.value_cells) : 0u;
     const uint layout_slots = sh_float4_slots(layout_rest);
     const ulong slot0 = sh_slot_start(p, layout_slots);
+    local = float4(1e30f);
+    value_local = float2(1e30f);
+    codes.touch = false;
     if (g.gradient != nullptr) {
         if (p >= uint(g.primitives))
-            return;
+            return false;
         float basis[15];
         if (compute)
             fast_sh_basis(direction, basis);
-        const float2 vmm = q16 ? g.value_bounds[t.block] : float2(0.0f);
+        const float2 vmm = q16 ? g.value_bounds[block] : float2(0.0f);
         for (uint j = 0; j < kFastShSlotsPerThread; ++j) {
             const uint k = part * kFastShSlotsPerThread + j;
             if (k >= layout_slots)
@@ -611,22 +705,18 @@ static void fast_adam_shN(constant FastAdamGroup& g, const uint p, const uint pa
             }
             reinterpret_cast<device float4*>(g.gradient)[slot] += grad;
         }
-        return;
+        return false;
     }
     const FastRowStep r = fast_row_step(g, p, 1.0f);
     const bool touch = r.touch && layout_slots > 0u && !(g.primitives > 0 && p >= uint(g.primitives));
+    codes.touch = touch;
     const uint active_slots = kFastShBases > 9u ? 12u : (kFastShBases > 4u ? 6u : 3u);
-    const float4 old_mm = touch ? g.bounds[t.block] : float4(0.0f);
-    const float2 old_vmm = q16 ? g.value_bounds[t.block] : float2(0.0f);
+    const float4 old_mm = touch ? g.bounds[block] : float4(0.0f);
+    const float2 old_vmm = q16 ? g.value_bounds[block] : float2(0.0f);
     float basis[15];
     if (compute)
         fast_sh_basis(direction, basis);
 
-    float4 us_u[kFastShSlotsPerThread];
-    float4 us_s[kFastShSlotsPerThread];
-    float4 updated[kFastShSlotsPerThread];
-    float4 local = float4(1e30f);
-    float2 value_local = float2(1e30f);
 #pragma unroll
     for (uint j = 0; j < kFastShSlotsPerThread; ++j) {
         const uint k = part * kFastShSlotsPerThread + j;
@@ -649,13 +739,13 @@ static void fast_adam_shN(constant FastAdamGroup& g, const uint p, const uint pa
             const float2 us = fast_shN_moment(grad[c], fast_slot_codes(packed, c), old_mm, r.apply, active_slot,
                                               beta1, beta2, r.step, eps, g.bc2_sqrt_rcp, value);
             values[c] = value;
-            us_u[j][c] = us.x;
-            us_s[j][c] = us.y;
+            codes.us_u[j][c] = us.x;
+            codes.us_s[j][c] = us.y;
             if (q16 && k * 4u + c < cells)
                 value_local = fmin(value_local, float2(value, -value));
             local = fmin(local, float4(us.x, -us.x, us.y, -us.y));
         }
-        updated[j] = values;
+        codes.updated[j] = values;
         if (r.apply && active_slot) {
             if (f16)
                 reinterpret_cast<device half4*>(g.param)[slot] = half4(values);
@@ -663,11 +753,17 @@ static void fast_adam_shN(constant FastAdamGroup& g, const uint p, const uint pa
                 reinterpret_cast<device float4*>(g.param)[slot] = values;
         }
     }
+    return true;
+}
 
-    const float4 mm = fast_block_bounds(local, scratch, t);
-    const float2 vmm = q16 ? threadgroup_q16_bounds(value_local.x, -value_local.y, scratch, t.lane, t.simd_lane,
-                                                    t.simd_group, t.simd_groups)
-                           : float2(0.0f);
+// The encode half of fast_adam_shN: lane 0 stores the new block bounds (mm)
+// and Q16 value bounds (vmm), every thread encodes its slots.
+static void fast_adam_shN_encode(constant FastAdamGroup& g, const uint p, const uint part, const uint layout_rest,
+                                 thread const FastShNCodes& codes, const float4 mm, const float2 vmm,
+                                 const FastLane t) {
+    const bool q16 = kFastShStorage == kFastShQ16;
+    const uint cells = q16 ? uint(g.value_cells) : 0u;
+    const uint layout_slots = sh_float4_slots(layout_rest);
     if (t.lane == 0u) {
         if (g.enabled != 0u && g.bounds != nullptr)
             g.bounds[t.block] = mm;
@@ -675,9 +771,10 @@ static void fast_adam_shN(constant FastAdamGroup& g, const uint p, const uint pa
             g.value_bounds[t.block] = vmm;
     }
 
-    if (!touch)
+    if (!codes.touch)
         return;
     const float2 inv = fast_inverse_ranges(mm);
+    const ulong slot0 = sh_slot_start(p, layout_slots);
     device ushort* q16_codes = sh_q16_cells(reinterpret_cast<device ushort*>(g.param), p, cells);
 #pragma unroll
     for (uint j = 0; j < kFastShSlotsPerThread; ++j) {
@@ -687,14 +784,14 @@ static void fast_adam_shN(constant FastAdamGroup& g, const uint p, const uint pa
         const ulong slot = slot0 + k * kShReorder;
         uint2 encoded = uint2(0u);
         for (uint c = 0; c < 4u; ++c) {
-            const float2 q = JointCodec<8>::encode_codes(us_u[j][c], us_s[j][c], mm.x, mm.z, inv.x, inv.y);
+            const float2 q = JointCodec<8>::encode_codes(codes.us_u[j][c], codes.us_s[j][c], mm.x, mm.z, inv.x, inv.y);
             const uint cell_bits = (uint(q.x) | (uint(q.y) << 8u)) << ((c & 1u) * 16u);
             if (c < 2u)
                 encoded.x |= cell_bits;
             else
                 encoded.y |= cell_bits;
             if (q16 && k * 4u + c < cells)
-                q16_codes[(k * 4u + c) * kShReorder] = sh_q16_encode(updated[j][c], vmm.x, vmm.y);
+                q16_codes[(k * 4u + c) * kShReorder] = sh_q16_encode(codes.updated[j][c], vmm.x, vmm.y);
         }
         reinterpret_cast<device uint2*>(g.packed)[slot] = encoded;
     }
@@ -780,12 +877,17 @@ kernel void fast_backward_sh(constant FastBackwardShParams& p [[buffer(0)]],
                              const uint lane [[thread_index_in_threadgroup]],
                              const uint simd_lane [[thread_index_in_simdgroup]],
                              const uint simd_group [[simdgroup_index_in_threadgroup]],
-                             const uint simd_groups [[simdgroups_per_threadgroup]]) {
+                             const uint simd_groups [[simdgroups_per_threadgroup]],
+                             const uint threads [[threads_per_threadgroup]]) {
     if (!fast_instances_fit(p.counts, p.capacity))
         return;
-    threadgroup float4 scratch[32];
+    // Per SIMD group: the sh0 and shN moment minimums and the Q16 value
+    // minimums; then the block's three minimums.
+    threadgroup float4 scratch[3u * 32u];
+    threadgroup float4 reduced[3];
     const FastLane t = {lane, simd_lane, simd_group, simd_groups, group};
-    // kFastShParts threads per primitive; part 0 also owns sh0 and the mean gradient.
+    // One or kFastShParts threads per primitive (the threadgroup holds 256 primitives);
+    // part 0 also owns sh0 and the mean gradient.
     const uint part = lane / uint(kJointBlock);
     const uint idx = group * uint(kJointBlock) + lane % uint(kJointBlock);
     const bool visible = idx < p.n && p.n_touched[idx] > 0u;
@@ -835,13 +937,55 @@ kernel void fast_backward_sh(constant FastBackwardShParams& p [[buffer(0)]],
             }
         }
     }
-    // The mean gradient reads the rest coefficients before any part updates them,
-    // and every part reads the color gradient before part 0 overwrites it.
-    threadgroup_barrier(mem_flags::mem_device);
-    fast_adam_step(p.sh0, sh0_grads, idx, 3u, 1.0f, p.beta1, p.beta2, p.eps, scratch, t, part == 0u);
+    // With two threads per primitive, part 0's mean gradient reads the rest
+    // coefficients before part 1 updates them, and part 1 reads the colour
+    // gradient before part 0 overwrites it. One thread orders that itself.
+    if (threads > uint(kJointBlock))
+        threadgroup_barrier(mem_flags::mem_device);
+    // The shN update first: its codes are the most registers, and the small sh0
+    // row should not stay live across it.
+    FastShNCodes shn_codes;
+    float4 shn_local = float4(1e30f);
+    float2 value_local = float2(1e30f);
+    bool shn_reduce = false;
     if (kFastShBases > 1u && (p.shN_adam.joint_bits == 8 || p.shN_adam.gradient != nullptr))
-        fast_adam_shN(p.shN_adam, idx, part, kFastShLayoutRest, grad_color, direction, visible, regularizer_allowed, p.sh_weight, sh_loss, p.n, p.beta1, p.beta2,
-                      p.eps, scratch, t);
+        shn_reduce = fast_adam_shN_update(p.shN_adam, idx, part, kFastShLayoutRest, grad_color, direction, visible,
+                                          regularizer_allowed, p.sh_weight, sh_loss, p.n, p.beta1, p.beta2, p.eps,
+                                          group, shn_codes, shn_local, value_local);
+    // fast_adam_step for sh0 in two halves: a capture pass only adds the
+    // gradient; the 16- and 8-bit codecs take the shared block reduction.
+    FastRowCodes sh0_codes;
+    sh0_codes.row = 0u;
+    float4 sh0_local = float4(1e30f);
+    const int sh0_bits = p.sh0.gradient == nullptr ? p.sh0.joint_bits : 0;
+    if (p.sh0.gradient != nullptr) {
+        if (part == 0u && idx < uint(p.sh0.primitives))
+            for (uint i = 0; i < 3u; ++i)
+                p.sh0.gradient[idx * 3u + i] += sh0_grads[i];
+    } else if (sh0_bits == 16) {
+        sh0_local = fast_adam_row_update<16>(p.sh0, sh0_grads, idx, 3u, 1.0f, p.beta1, p.beta2, p.eps, group,
+                                             part == 0u, sh0_codes);
+    } else if (sh0_bits == 8) {
+        sh0_local = fast_adam_row_update<8>(p.sh0, sh0_grads, idx, 3u, 1.0f, p.beta1, p.beta2, p.eps, group,
+                                            part == 0u, sh0_codes);
+    }
+    const float4 partials[3] = {fast_simd_min4(sh0_local), fast_simd_min4(shn_local),
+                                fast_simd_min4(float4(value_local.x, value_local.y, 0.0f, 0.0f))};
+    if (simd_lane == 0u)
+        for (uint i = 0; i < 3u; ++i)
+            scratch[i * 32u + simd_group] = partials[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // One lane per reduction, over the SIMD groups in order, as threadgroup_min4.
+    if (lane < 3u)
+        reduced[lane] = fast_group_min4(scratch + lane * 32u, simd_groups);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sh0_bits == 16)
+        fast_adam_row_encode<16>(p.sh0, sh0_codes, fast_bounds_of(reduced[0]), t);
+    else if (sh0_bits == 8)
+        fast_adam_row_encode<8>(p.sh0, sh0_codes, fast_bounds_of(reduced[0]), t);
+    if (shn_reduce)
+        fast_adam_shN_encode(p.shN_adam, idx, part, kFastShLayoutRest, shn_codes, fast_bounds_of(reduced[1]),
+                             kFastShStorage == kFastShQ16 ? fast_value_bounds_of(reduced[2]) : float2(0.0f), t);
     // The regularizer losses are only reported. One atomic per SIMD group: an add
     // per coefficient into one address cost more than the regularizers themselves.
     if (p.dc_loss != nullptr) {
