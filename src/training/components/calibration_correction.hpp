@@ -37,9 +37,10 @@ namespace lfs::training {
                           const core::Tensor& render, core::Tensor& mask, core::Tensor& structure,
                           core::Tensor& edge, bool first_tile = true, const Composite* composite = nullptr,
                           bool wrap = false);
-        // The gradient contains both image terms when appearance and geometry are decoupled.
+        // The gradient contains both image terms when appearance and geometry are decoupled: either summed by the
+        // caller, or as gradient plus gradient_raw, which a backend with accumulate_pair adds per pixel.
         void accumulate(const core::Tensor& render, const core::Tensor& gradient, const core::Tensor& weight,
-                        float values, int margin = 0);
+                        float values, int margin = 0, const core::Tensor& gradient_raw = {});
         // Clears a gradient of the last warped tile where the sample falls outside the photograph: the target there
         // is the render itself, and no loss term may push it.
         void clear_outside(core::Tensor& gradient) const;

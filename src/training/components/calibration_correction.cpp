@@ -152,10 +152,15 @@ namespace lfs::training {
     }
 
     void CalibrationCorrection::accumulate(const Tensor& render, const Tensor& gradient, const Tensor& weight,
-                                           float values, int margin) {
+                                           float values, int margin, const Tensor& gradient_raw) {
         const int cells = tile_.side - 1, chunks = chunks_for(tile_);
         reserve(partials_, {size_t(cells * cells), size_t(chunks), 21});
-        ops_->accumulate(tile_, field_, slot_, image_, render, gradient, weight, values, margin, chunks, first_tile_, partials_);
+        if (gradient_raw.is_valid() && ops_->accumulate_pair)
+            ops_->accumulate_pair(tile_, field_, slot_, image_, render, gradient, gradient_raw, weight, values, margin, chunks,
+                                  first_tile_, partials_);
+        else
+            ops_->accumulate(tile_, field_, slot_, image_, render, gradient_raw.is_valid() ? gradient + gradient_raw : gradient,
+                             weight, values, margin, chunks, first_tile_, partials_);
     }
 
     void CalibrationCorrection::clear_outside(Tensor& gradient) const {

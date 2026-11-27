@@ -14,14 +14,14 @@ namespace lfs::training {
         using core::GpuKernelModule;
         using Tile = CalibrationTile;
 
-        // Parameters in calibration.slang: 19 tensor pointers, then the scalars.
+        // Parameters in calibration.slang: 20 tensor pointers, then the scalars.
         struct Parameters {
-            uint64_t pointers[19]{};
+            uint64_t pointers[20]{};
             Tile tile{};
             int slot = 0, background_image = 0, chunks = 0, margin = 0, first = 0, channels = 0;
             float values = 0, step = 0;
         };
-        static_assert(sizeof(Parameters) == 224 && offsetof(Parameters, tile) == 152);
+        static_assert(sizeof(Parameters) == 232 && offsetof(Parameters, tile) == 160);
         enum Slot { Field,
                     Photo,
                     PhotoBytes,
@@ -41,6 +41,7 @@ namespace lfs::training {
                     Stable,
                     Grad,
                     Partials,
+                    GradRaw,
                     SlotCount };
         struct Tensors {
             std::array<const Tensor*, SlotCount> slots{};
@@ -111,13 +112,14 @@ namespace lfs::training {
             run("resample", field, p, s, pixel_groups(t));
         }
 
-        void accumulate(const Tile& t, In field, int slot, In image, In render, In grad, In weight,
-                        float values, int margin, int chunks, bool first, Out partials) {
+        void accumulate_pair(const Tile& t, In field, int slot, In image, In render, In grad, In grad_raw, In weight,
+                             float values, int margin, int chunks, bool first, Out partials) {
             Tensors s;
             s.read(Field, &field);
             s.read(Photo, &image);
             s.read(Render, &render);
             s.read(Grad, &grad);
+            s.read(GradRaw, &grad_raw);
             if (weight.is_valid())
                 s.read(bytes(weight) ? MaskBytes : Mask, &weight);
             s.write(Partials, &partials);
@@ -127,6 +129,11 @@ namespace lfs::training {
             p.margin = margin;
             p.values = values;
             run("accumulate", field, p, s, uint32_t((t.side - 1) * (t.side - 1) * chunks));
+        }
+
+        void accumulate(const Tile& t, In field, int slot, In image, In render, In grad, In weight,
+                        float values, int margin, int chunks, bool first, Out partials) {
+            accumulate_pair(t, field, slot, image, render, grad, {}, weight, values, margin, chunks, first, partials);
         }
 
         void update(const Tile& t, Out field, int slot, In partials, int chunks, float step) {
@@ -157,7 +164,7 @@ namespace lfs::training {
         }
     } // namespace
     const gpu_ops::CalibrationOps& portable_calibration_ops() {
-        static const gpu_ops::CalibrationOps ops{sample, accumulate, update, clear_outside, follow};
+        static const gpu_ops::CalibrationOps ops{sample, accumulate, update, clear_outside, follow, accumulate_pair};
         return ops;
     }
 } // namespace lfs::training

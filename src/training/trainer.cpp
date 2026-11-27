@@ -1778,7 +1778,8 @@ namespace lfs::training {
             photo_loss_, photo_grad_corrected_, photo_grad_raw_);
         std::optional<RawGradientResidual> raw_residual;
         if (fit)
-            fit->accumulate(corrected, photo_grad_raw_.is_valid() ? (photo_grad_corrected_ + photo_grad_raw_) : photo_grad_corrected_, {}, photometric_value_count(), photometric_valid_padding);
+            fit->accumulate(corrected, photo_grad_corrected_, {}, photometric_value_count(), photometric_valid_padding,
+                            photo_grad_raw_);
         add_gradient_residual(corrected, gt_image, raw_rendered, {}, opt_params, iteration,
                               photo_loss_, photo_grad_corrected_, raw_residual);
         return PhotometricLossResult{
@@ -1948,7 +1949,7 @@ namespace lfs::training {
                 loss, grad_corrected, grad_raw);
 
             if (fit)
-                fit->accumulate(corrected, grad_raw.is_valid() ? (grad_corrected + grad_raw) : grad_corrected, photometric_weight, photo_saved_.mask_denominator);
+                fit->accumulate(corrected, grad_corrected, photometric_weight, photo_saved_.mask_denominator, 0, grad_raw);
 
             // The loss already reads this normalization; epsilon alone means no contributing pixels.
             if (has_user_mask && mode == param::MaskMode::Ignore && !empty_ignore_mask_warned_ &&

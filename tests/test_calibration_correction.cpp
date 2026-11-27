@@ -45,6 +45,38 @@ namespace {
         fit.field() = Tensor::from_vector(row, fit.field().shape(), Device::GPU);
     }
 } // namespace
+// With decoupled appearance and geometry the loss gradient has a corrected and a raw image term. accumulate adds
+// them per pixel as the caller's sum would, so the fit must keep every bit, with a weight and with a margin.
+TEST(CalibrationCorrectionTest, GradientPairMatchesTheSum) {
+    constexpr int w = 1297, h = 840;
+    const auto photo = texture(w, h);
+    const auto render = texture(w, h) * .9f + .05f;
+    const auto grad = (texture(w, h) - .5f) * 1e-4f;
+    const auto grad_raw = (texture(w, h) * .7f - .3f) * 1e-4f;
+    std::vector<float> mask(size_t(w) * h);
+    for (size_t i = 0; i < mask.size(); ++i)
+        mask[i] = float(i % 5) * .5f;
+    const auto weight = Tensor::from_vector(mask, {size_t(h), size_t(w)}, Device::GPU);
+    const Tensor none;
+    std::vector<float> fields[2];
+    for (int pair = 0; pair < 2; ++pair) {
+        CalibrationCorrection fit(4);
+        for (int i = 0; i < 6; ++i) {
+            (void)warp(fit, i % 4, photo, render, 1000, 1000);
+            const Tensor& pixel_weight = i % 2 ? weight : none;
+            const int margin = i % 2 ? 0 : 5;
+            if (pair)
+                fit.accumulate(render, grad, pixel_weight, 3.f * w * h, margin, grad_raw);
+            else
+                fit.accumulate(render, grad + grad_raw, pixel_weight, 3.f * w * h, margin);
+            fit.update();
+        }
+        fields[pair] = fit.field().to_vector();
+    }
+    ASSERT_EQ(fields[0].size(), fields[1].size());
+    EXPECT_EQ(std::memcmp(fields[0].data(), fields[1].data(), fields[0].size() * sizeof(float)), 0);
+}
+
 TEST(CalibrationCorrectionTest, AngularDisplacementScalesWithResolutionAndUsesFullImageCoordinates) {
     CalibrationCorrection fit(1);
     std::vector<float> field(162);

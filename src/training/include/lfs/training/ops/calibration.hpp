@@ -21,6 +21,10 @@ namespace lfs::gpu_ops {
         void (*update)(const CalibrationTile&, Out field, int slot, In partials, int chunks, float step);
         void (*clear_outside)(const CalibrationTile&, In field, int slot, Out gradient);
         void (*follow)(const CalibrationTile&, In field, int slot, In prior, Out output, int channels);
+        // Null unless the backend has it: accumulate with the gradient given as two images (the decoupled corrected
+        // and raw gradients), added per pixel as their sum would be.
+        void (*accumulate_pair)(const CalibrationTile&, In field, int slot, In image, In render, In grad, In grad_raw,
+                                In weight, float values, int margin, int chunks, bool first, Out partials) = nullptr;
     };
 } // namespace lfs::gpu_ops
 namespace lfs::training {

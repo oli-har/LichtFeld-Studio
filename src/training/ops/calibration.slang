@@ -23,6 +23,7 @@ struct Parameters {
     Ptr<float, Access.ReadWrite> out_edge;
     Ptr<float, Access.Read> alpha, background, stable_background;
     Ptr<float, Access.ReadWrite> stable, grad, partials;
+    Ptr<float, Access.Read> grad_raw; // accumulate: the raw render's gradient, added to grad per pixel when present
     int width, height, x, y, w, h, side; // the Tile, flattened for the tensor binding ABI
     float sx, sy;
     int wrap;
@@ -220,12 +221,13 @@ void accumulate(uint3 groupId : SV_GroupID, uint laneId : SV_GroupIndex) {
     const Tile t = tile();
     const int group = int(groupId.x), lane = int(laneId);
     const bool byte_weight = present(p.mask_u8), float_weight = present(p.mask);
-    const bool has_grad = present(p.grad);
+    const bool has_grad = present(p.grad), has_grad_raw = present(p.grad_raw);
     int chunks = p.chunks, margin = p.margin;
     float values = p.values;
     let image = p.photo;
     let rendered = p.render;
     let grad = p.grad;
+    let grad_raw = p.grad_raw;
     const int cells = t.side - 1;
     const int cell = group / chunks, col = cell % cells, r = cell / cells;
     const int x0 = (2 * col * t.width + cells - 1) / (2 * cells), x1 = (2 * (col + 1) * t.width + cells - 1) / (2 * cells);
@@ -268,7 +270,9 @@ void accumulate(uint3 groupId : SV_GroupID, uint laneId : SV_GroupIndex) {
             const float dy = .5f * t.sy * (image[i + t.w] - image[i - t.w]);
             const float residual = image[i] - rendered[i];
             ss += residual * residual;
-            const float g = has_grad ? -epsilon * values * grad[i] : residual;
+            // The decoupled gradient is the two images' sum: added here as the caller's sum would round it.
+            const float gi = has_grad ? (has_grad_raw ? grad[i] + grad_raw[i] : grad[i]) : 0.f;
+            const float g = has_grad ? -epsilon * values * gi : residual;
             q[0] += dx * g;
             q[1] += dy * g;
             q[2] += dx * dx;
