@@ -2950,6 +2950,16 @@ namespace {
             compare_training_changes(run(GpuBackend::Vulkan), run(GpuBackend::CUDA));
         }
     }
+    TEST(TrainingOpsFastParity, RenderedOnlyAdamAndPerSplatBlendPeakMetalMatchesVulkan) {
+        if (!lfs::core::gpu_backend_available(GpuBackend::Metal) || !lfs::core::gpu_backend_available(GpuBackend::Vulkan))
+            GTEST_SKIP();
+        for (bool mip : {false, true}) {
+            const auto run = [&](GpuBackend backend) {
+                return capture_fast_nonzero(backend, 3, mip, false, true, false, DensificationType::MRNF, true, -1, false, true);
+            };
+            compare_training_changes(run(GpuBackend::Metal), run(GpuBackend::Vulkan));
+        }
+    }
 
     TEST(TrainingOpsFastParity, NonzeroImageGradientAndFusedAdamVulkan) {
         if (!lfs::core::gpu_backend_available(GpuBackend::CUDA) || !lfs::core::gpu_backend_available(GpuBackend::Vulkan))

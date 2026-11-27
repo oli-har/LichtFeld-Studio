@@ -289,6 +289,8 @@ namespace {
         std::vector<double> weight, weight_error, weight_edge; // per splat
         // Per splat: summed and peak per-pixel change when the splat is removed.
         std::vector<double> impact_sum, impact_peak;
+        // Per splat: the largest blend weight alpha * T over the pixels.
+        std::vector<double> blend_peak;
     };
 
     // Front-to-back blend over splats ordered by (depth key, index). With
@@ -315,6 +317,7 @@ namespace {
         r.weight_edge.assign(s.count, 0.0);
         r.impact_sum.assign(s.count, 0.0);
         r.impact_peak.assign(s.count, 0.0);
+        r.blend_peak.assign(s.count, 0.0);
         struct Fragment {
             int splat;
             double alpha, weight;
@@ -342,6 +345,7 @@ namespace {
                     depth += w * g.depth;
                     fragments.push_back({i, alpha, w});
                     r.weight[i] += w;
+                    r.blend_peak[i] = std::max(r.blend_peak[i], w);
                     if (error != nullptr)
                         r.weight_error[i] += w * (*error)[pixel];
                     if (edge != nullptr)
@@ -1361,6 +1365,143 @@ namespace {
         for (const double v : r.impact_sum)
             total += v;
         EXPECT_GT(total, 1.0) << "the scene must exercise the impact walk";
+    }
+
+    // MRNF's retire quota and keep-covered read each splat's largest blend weight alpha * T of the view, raised
+    // into the row it passes (atomic max). Its densification buffer is [4, N]: the backward adds to rows 0 and 1
+    // and leaves the strategy's rows 2 and 3 alone.
+    TEST_P(PortableFastRaster, BlendPeakMatchesReference) {
+        Scene s = make_scene(30, 1, 48, 40, 46u, -2.3f, -1.6f);
+        const auto n = static_cast<size_t>(s.count);
+        const size_t pixels = size_t{static_cast<size_t>(s.width)} * s.height;
+        std::mt19937 rng(9u);
+        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+        std::vector<float> error(pixels);
+        for (auto& v : error)
+            v = uniform(rng);
+        const View view = make_view(s, false);
+        const Rendered r = render(s, Params(s), view, nullptr, &error);
+        size_t rendered = 0;
+        for (const double v : r.blend_peak)
+            rendered += v > 0.0 ? 1 : 0;
+        ASSERT_GT(rendered, n / 2) << "the scene must render most splats";
+        const LossWeights w = random_weights(s.width, s.height, 14u, false);
+        for (const bool zeroed : {true, false}) {
+            SCOPED_TRACE(zeroed ? "zeroed row" : "row with earlier values");
+            // Earlier values below and above this view's peak, and on splats the view does not render.
+            std::vector<float> initial(n, 0.0f);
+            if (!zeroed)
+                for (size_t i = 0; i < n; ++i)
+                    initial[i] = static_cast<float>(r.blend_peak[i]) * (i % 2 == 0 ? 0.5f : 1.5f) +
+                                 0.01f * static_cast<float>(i % 3);
+            Gpu g = upload_scene(s, ops::ShStorage::Float32);
+            Frame frame;
+            forward(frame, s, g, {});
+            ASSERT_EQ(frame.result.code, ops::RasterResult::Code::Success) << frame.result.message;
+            AdamState state;
+            ops::BackwardAdam adam = make_adam(g, state, s.count, {});
+            adam.blend_peak = upload(initial, {n});
+            std::vector<float> rows(4 * n, 0.0f);
+            for (size_t i = 0; i < 2 * n; ++i)
+                rows[2 * n + i] = 3.0f + static_cast<float>(i % 7);
+            Tensor densification = upload(rows, {4, n});
+            const Tensor error_map = upload(error, {static_cast<size_t>(s.height), static_cast<size_t>(s.width)});
+            Tensor none;
+            fast_ops().backward(frame.saved,
+                                {.image = plane(w.image, 3, s.height, s.width), .alpha = none, .depth = none, .normal = none},
+                                densification, error_map, none, none, adam, DensificationType::MRNF);
+            std::vector<double> expected(n);
+            for (size_t i = 0; i < n; ++i)
+                expected[i] = std::max<double>(initial[i], r.blend_peak[i]);
+            expect_close(download(adam.blend_peak), expected, 1e-5, "blend peak");
+            const std::vector<float> dens = download(densification);
+            expect_close(std::vector<float>(dens.begin(), dens.begin() + n), r.weight, 1e-4, "densification row 0");
+            double scale = 1.0;
+            for (const double v : r.weight_error)
+                scale = std::max(scale, std::abs(v));
+            expect_close(std::vector<float>(dens.begin() + n, dens.begin() + 2 * n), r.weight_error, 2e-3 * scale,
+                         "densification row 1");
+            EXPECT_TRUE(std::equal(dens.begin() + 2 * n, dens.end(), rows.begin() + 2 * n)) << "rows 2 and 3 changed";
+        }
+    }
+
+    // MRNF regularizes shape only where a splat renders: with reg_rendered_only a splat that covers no pixel of the
+    // view (culled, or visible but below the alpha cutoff at every pixel) gets no scale, flatten or rank gradient,
+    // so with fresh moments its scales stay put; the opacity regularizer still applies, and splats that render step
+    // as without the flag.
+    TEST_P(PortableFastRaster, RenderedOnlyRegularizersSkipSplatsThatDidNotRender) {
+        Scene s = make_scene(64, 1, 32, 32, 47u, -3.2f, -2.2f);
+        // Odd splats faint: about half of them sit within reach of a pixel centre, the rest touch a tile but no
+        // pixel. Two behind the camera are culled.
+        for (int i = 1; i < s.count; i += 2)
+            s.opacities[static_cast<size_t>(i)] = -5.3f;
+        for (const int i : {4, 10})
+            s.means[static_cast<size_t>(i) * 3 + 2] = -6.0f;
+        const auto n = static_cast<size_t>(s.count);
+        const View view = make_view(s, false);
+        const LossWeights w = random_weights(s.width, s.height, 15u, false);
+        std::array<HostParams, 2> after;
+        std::array<std::vector<float>, 2> peaks;
+        std::array<float, 2> erank_loss{}, scale_loss{};
+        for (const bool rendered_only : {false, true}) {
+            Gpu g = upload_scene(s, ops::ShStorage::Float32);
+            Frame frame;
+            forward(frame, s, g, {});
+            ASSERT_EQ(frame.result.code, ops::RasterResult::Code::Success) << frame.result.message;
+            AdamState state;
+            state.scale_loss = Tensor::zeros({1}, Device::GPU);
+            state.opacity_loss = Tensor::zeros({1}, Device::GPU);
+            ops::BackwardAdam adam = make_adam(g, state, s.count, {});
+            adam.scale_reg_weight = 0.01f;
+            adam.flatten_reg_weight = 0.003f;
+            adam.opacity_reg_weight = 0.005f;
+            adam.erank_reg_weight = 0.002f;
+            adam.erank_reg_loss = Tensor::zeros({1}, Device::GPU);
+            adam.blend_peak = Tensor::zeros({n}, Device::GPU);
+            adam.reg_rendered_only = rendered_only;
+            Tensor none;
+            fast_ops().backward(frame.saved,
+                                {.image = plane(w.image, 3, s.height, s.width), .alpha = none, .depth = none, .normal = none},
+                                none, none, none, none, adam, DensificationType::None);
+            after[rendered_only] = read_params(g);
+            peaks[rendered_only] = download(adam.blend_peak);
+            erank_loss[rendered_only] = download(adam.erank_reg_loss)[0];
+            scale_loss[rendered_only] = download(state.scale_loss)[0];
+        }
+        EXPECT_EQ(peaks[0], peaks[1]) << "the peak does not depend on the flag";
+        // The reported losses still cover every splat.
+        EXPECT_NEAR(erank_loss[1], erank_loss[0], 1e-6 * std::max(1.0f, std::abs(erank_loss[0])));
+        EXPECT_NEAR(scale_loss[1], scale_loss[0], 1e-6 * std::max(1.0f, std::abs(scale_loss[0])));
+        size_t rendered = 0, silent = 0, culled = 0;
+        for (size_t i = 0; i < n; ++i) {
+            SCOPED_TRACE(std::format("splat {}", i));
+            const bool visible = project(s, Params(s), view, static_cast<int>(i), true).visible;
+            if (peaks[1][i] > 0.0f) {
+                ++rendered;
+                for (size_t k = 0; k < 3; ++k) {
+                    EXPECT_NEAR(after[1].scales[3 * i + k], after[0].scales[3 * i + k], 1e-6);
+                    EXPECT_NEAR(after[1].means[3 * i + k], after[0].means[3 * i + k], 1e-6);
+                }
+                EXPECT_NEAR(after[1].opacities[i], after[0].opacities[i], 1e-6);
+                continue;
+            }
+            visible ? ++silent : ++culled;
+            // Vulkan without its quadrant layout (devices without wave32 pipelines) cannot tell a visible splat
+            // that covers no pixel from one that does, and regularizes both.
+            if (visible && backend_under_test() == GpuBackend::Vulkan)
+                continue;
+            bool moved = false;
+            for (size_t k = 0; k < 3; ++k) {
+                EXPECT_EQ(std::bit_cast<uint32_t>(after[1].scales[3 * i + k]), std::bit_cast<uint32_t>(s.scales[3 * i + k]));
+                moved |= after[0].scales[3 * i + k] != s.scales[3 * i + k];
+            }
+            EXPECT_TRUE(moved) << "without the flag the shape regularizers move the scales";
+            EXPECT_EQ(std::bit_cast<uint32_t>(after[1].opacities[i]), std::bit_cast<uint32_t>(after[0].opacities[i]));
+            EXPECT_NE(after[1].opacities[i], s.opacities[i]) << "the opacity regularizer still applies";
+        }
+        EXPECT_GT(rendered, 0u);
+        EXPECT_GT(silent, 0u) << "the scene must have a visible splat that renders no pixel";
+        EXPECT_GT(culled, 0u);
     }
 
     // Q16 shN: the fused step moves the decoded values by -grad and re-encodes them

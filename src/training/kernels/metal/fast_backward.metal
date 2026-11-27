@@ -8,10 +8,13 @@
 // that owns one joint-bounds row.
 
 // Per-primitive gradient helper row: mean2d (0, 1), conic (2..4), opacity
-// (5), color (6..8; replaced by the SH mean gradient), depth (9). A row
-// starts at ulong(primitive) * kFastGradStride: in 32 bits that offset wraps
-// past 357.9M primitives.
+// (5), color (6..8; replaced by the SH mean gradient), depth (9), and with
+// kFastBlendPeak the largest blend weight alpha * T over the view's pixels
+// (10, float bits raised by atomic max). A row starts at
+// ulong(primitive) * kFastGradStride: in 32 bits that offset wraps past
+// 357.9M primitives.
 constant constexpr uint kFastGradStride = 12u;
+constant constexpr uint kFastGradPeak = 10u;
 constant constexpr float kFastGradClamp = 1e4f;
 
 static float fast_clamp_grad(const float g) { return fmin(fmax(g, -kFastGradClamp), kFastGradClamp); }
@@ -143,6 +146,7 @@ struct FastBlendAccum {
     float edge;
     float impact_sum;
     float impact_peak;
+    float blend_peak;
 };
 
 // One pixel's contribution of one splat, walking back to front.
@@ -165,6 +169,8 @@ static bool fast_accumulate_pixel(thread FastBackwardPixel& s, thread FastBlendA
     const float one_minus_alpha = 1.0f - alpha;
     const float transmittance_before = s.transmittance / fmax(one_minus_alpha, 1e-4f);
     const float weight = transmittance_before * alpha;
+    if (kFastBlendPeak != 0u)
+        a.blend_peak = fmax(a.blend_peak, weight);
     a.edge += weight * s.edge_weight;
     if (kFastImpactScore != 0u) {
         // How much the pixel changes when this splat is removed.
@@ -318,7 +324,7 @@ kernel void fast_blend_backward(constant FastBlendBackwardParams& p [[buffer(0)]
             const float3 normal = kFastNormalChannel != 0u ? s_normal[j] : float3(0.0f);
 
             FastBlendAccum a = {float3(0.0f), 0.0f, float3(0.0f), 0.0f, float3(0.0f), 0.0f, 0.0f, 0.0f,
-                               0.0f, 0.0f};
+                               0.0f, 0.0f, 0.0f};
             bool contributed = false;
 #pragma unroll
             for (uint k = 0u; k < kFastBwdSubtiles; ++k) {
@@ -364,6 +370,14 @@ kernel void fast_blend_backward(constant FastBlendBackwardParams& p [[buffer(0)]
                 } else if (edge) {
                     fast_atomic_add(p.edge_score + prim, total);
                 }
+            }
+            // Lane 1 has no sum to add: it raises the peak in the row the sums go to.
+            if (kFastBlendPeak != 0u) {
+                const float peak = simd_max(a.blend_peak);
+                if (lane == 1u && peak > 0.0f)
+                    atomic_fetch_max_explicit(reinterpret_cast<device atomic_uint*>(
+                                                  p.grads + ulong(prim) * kFastGradStride + kFastGradPeak),
+                                              as_type<uint>(peak), memory_order_relaxed);
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -878,6 +892,10 @@ struct FastBackwardGeometryParams {
     device const uchar* mean_far;
     float scale_normalizer, erank_weight, mean_median;
     uint per_splat_mean_step;
+    // Optional [N] row raised to each splat's peak blend weight of the view (kFastBlendPeak).
+    device float* blend_peak;
+    // The scale, flatten and rank regularizers skip splats that did not contribute (needs kFastBlendPeak).
+    uint reg_rendered_only;
 };
 
 static float fast_sigmoid(const float x) { return 1.0f / (1.0f + exp(-x)); }
@@ -977,11 +995,21 @@ kernel void fast_backward_geometry(constant FastBackwardGeometryParams& p [[buff
     float scale_grads[3] = {0.0f, 0.0f, 0.0f};
     float opacity_grads[1] = {0.0f};
     const bool visible = in_range && p.n_touched[idx] > 0u;
+    // The blend's peak is positive exactly when the splat covered a pixel of the view, as
+    // CUDA's touched flag; only visible splats have a cleared row.
+    const float blend_peak =
+        kFastBlendPeak != 0u && visible ? p.grads[ulong(idx) * kFastGradStride + kFastGradPeak] : 0.0f;
+    const bool contributed = kFastBlendPeak != 0u ? blend_peak > 0.0f : visible;
+    const bool shape_reg = p.reg_rendered_only == 0u || contributed;
+    if (kFastBlendPeak != 0u && p.blend_peak != nullptr && blend_peak > 0.0f)
+        p.blend_peak[idx] = fmax(p.blend_peak[idx], blend_peak);
     if (in_range && !visible) {
         // Regularizers only; the other groups decay their moments.
-        for (uint i = 0; i < 3u; ++i)
-            scale_grads[i] = fast_scale_reg_grad(p, idx * 3u + i);
-        fast_flatten_reg_grads(p, idx * 3u, scale_grads);
+        if (shape_reg) {
+            for (uint i = 0; i < 3u; ++i)
+                scale_grads[i] = fast_scale_reg_grad(p, idx * 3u + i);
+            fast_flatten_reg_grads(p, idx * 3u, scale_grads);
+        }
         opacity_grads[0] = fast_opacity_extra_grad(p, idx);
     } else if (visible) {
         device const float* g = p.grads + ulong(idx) * kFastGradStride;
@@ -1077,9 +1105,10 @@ kernel void fast_backward_geometry(constant FastBackwardGeometryParams& p [[buff
                 2.0f * (col2.x * col2.y * dcov3d.m12 + col2.x * col2.z * dcov3d.m13 + col2.y * col2.z * dcov3d.m23));
         for (uint i = 0; i < 3u; ++i) {
             const float draw = raw_scale[i] < kFastMaxRawScale ? 2.0f * variance[i] * dvariance[i] : 0.0f;
-            scale_grads[i] = fast_clamp_grad(draw) + fast_scale_reg_grad(p, idx * 3u + i);
+            scale_grads[i] = fast_clamp_grad(draw) + (shape_reg ? fast_scale_reg_grad(p, idx * 3u + i) : 0.0f);
         }
-        fast_flatten_reg_grads(p, idx * 3u, scale_grads);
+        if (shape_reg)
+            fast_flatten_reg_grads(p, idx * 3u, scale_grads);
 
         // dL/dR, rows; rs = R diag(variance).
         const float3 rs0 = rot.r0 * variance, rs1 = rot.r1 * variance, rs2 = rot.r2 * variance;
@@ -1133,8 +1162,9 @@ kernel void fast_backward_geometry(constant FastBackwardGeometryParams& p [[buff
         const EffectiveRankPenalty penalty = effective_rank_penalty(raw.x, raw.y, raw.z);
         const float coefficient = p.erank_weight / float(p.n);
         erank_loss = coefficient * penalty.value;
-        for (uint axis = 0; axis < 3u; ++axis)
-            scale_grads[axis] += coefficient * penalty.gradient[axis];
+        if (shape_reg)
+            for (uint axis = 0; axis < 3u; ++axis)
+                scale_grads[axis] += coefficient * penalty.gradient[axis];
     }
     if (p.erank_loss != nullptr) {
         const float total = fast_block_sum(erank_loss, sum_scratch, t);
