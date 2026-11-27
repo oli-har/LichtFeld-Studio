@@ -1535,8 +1535,20 @@ namespace lfs::core {
         // flat view. Duplicate targets keep the last value on Vulkan and
         // Metal; CUDA keeps any one of them.
         if (gpu_scatter) {
-            LFS_ASSERT_MSG(numel() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
-                           std::format("index_put_ addresses its destination in int32 (numel={})", numel()));
+            // The indices are int32. A flat position counts elements, so the whole tensor must fit. A row index counts
+            // rows, so where the scatter addresses the destination row in 64 bits only the rows must fit: Metal's
+            // index_op does. CUDA's index_copy reads as 64-bit but is not yet tested past 357.9M rows of six floats;
+            // Vulkan's element helpers index the destination from its base, which on NVIDIA wraps past 4 GiB. Both keep
+            // the element bound; adding a backend here is the switch.
+            const auto backend = gpu_backend_of(*this);
+            const bool scatter_rows_in_64_bits = backend == GpuBackend::Metal;
+            const bool rows_addressed_in_64_bits = is_row_assignment && scatter_rows_in_64_bits;
+            if (rows_addressed_in_64_bits)
+                LFS_ASSERT_MSG(shape_[0] <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+                               std::format("index_put_ addresses its destination rows in int32 (rows={})", shape_[0]));
+            else
+                LFS_ASSERT_MSG(numel() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+                               std::format("index_put_ addresses its destination in int32 (numel={})", numel()));
             Tensor idx_int32 = idx_same_device;
             Tensor destination = *this;
             Tensor source = vals_same_device;
