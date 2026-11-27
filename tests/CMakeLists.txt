@@ -1201,6 +1201,7 @@ if(NOT LFS_HAS_CUDA)
         test_tensor_metal.cpp
         test_lpips_fast_path.cpp
         test_lpips_pair.cpp
+        test_image_save_device.cpp
         test_camera_priors_portable.cpp
         test_undistort_portable.cpp
         test_pipelined_loader_backends.cpp
@@ -1771,6 +1772,7 @@ set(TEST_FILES
     test_metrics_evaluator_appearance.cpp
     test_export_env_composite.cpp
     test_image_io.cpp
+    test_image_save_device.cpp
     test_project_thumbnail_image.cpp
     test_mask_resized_cache.cpp
     test_mask_rgb_cache.cpp
